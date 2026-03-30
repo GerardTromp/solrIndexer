@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>fsearch — Filesystem Search</title>
+<style>
+/* ── Reset & base ──────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #1a1b26;
+  --bg-alt:   #24283b;
+  --bg-row:   #1f2233;
+  --border:   #3b4261;
+  --text:     #c0caf5;
+  --text-dim: #565f89;
+  --accent:   #7aa2f7;
+  --accent2:  #bb9af7;
+  --green:    #9ece6a;
+  --red:      #f7768e;
+  --orange:   #e0af68;
+  --cyan:     #7dcfff;
+  --mark-bg:  #e0af6833;
+  --mark-fg:  #e0af68;
+}
+
+body {
+  font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", "Consolas", monospace;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  padding: 16px 24px;
+}
+
+/* ── Header ────────────────────────────────────────────────────────────── */
+h1 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 16px;
+}
+h1 span { color: var(--text-dim); font-weight: 400; }
+
+/* ── Search form area ──────────────────────────────────────────────────── */
+#search-form {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+/* ── Search row ────────────────────────────────────────────────────────── */
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  background: var(--bg-row);
+  transition: background 0.15s;
+}
+.search-row:hover { background: #282d45; }
+.search-row.drag-over { border-top: 2px solid var(--accent); }
+
+.drag-handle {
+  cursor: grab;
+  color: var(--text-dim);
+  font-size: 14px;
+  padding: 0 4px;
+  user-select: none;
+}
+.drag-handle:active { cursor: grabbing; }
+
+.search-row select,
+.search-row input[type="text"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.join-select { width: 70px; }
+.field-select { width: 100px; }
+.value-input { flex: 1; min-width: 120px; }
+.value-input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+.btn-icon {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  line-height: 1;
+}
+.btn-icon:hover { color: var(--text); background: var(--bg); }
+.btn-remove:hover { color: var(--red); }
+
+/* ── Controls bar ──────────────────────────────────────────────────────── */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  padding: 6px 16px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover { opacity: 0.9; }
+.btn-secondary {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { border-color: var(--accent); }
+
+.controls label {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.controls select, .controls input[type="number"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+/* ── Status bar ────────────────────────────────────────────────────────── */
+#status {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin: 8px 0;
+  min-height: 18px;
+}
+#status .query-text { color: var(--accent2); }
+#status .error { color: var(--red); }
+
+/* ── Results table ─────────────────────────────────────────────────────── */
+#results-area { margin-top: 4px; }
+
+table.results {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+table.results th {
+  text-align: left;
+  padding: 6px 10px;
+  color: var(--accent);
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+table.results th:hover { color: var(--cyan); }
+
+table.results td {
+  padding: 4px 10px;
+  border-bottom: 1px solid #2a2e42;
+  vertical-align: top;
+}
+
+table.results tr.result-row { cursor: pointer; }
+table.results tr.result-row:hover { background: #282d45; }
+table.results tr.result-row.expanded { background: var(--bg-alt); }
+
+td.path-cell {
+  word-break: break-all;
+  color: var(--green);
+  max-width: 0;   /* allow table column to shrink */
+}
+td.ext-cell  { color: var(--orange); white-space: nowrap; }
+td.size-cell { text-align: right; white-space: nowrap; color: var(--cyan); }
+td.date-cell { white-space: nowrap; }
+
+/* highlight snippets row */
+tr.snippet-row td {
+  padding: 2px 10px 2px 28px;
+  color: var(--text-dim);
+  font-size: 11px;
+  border-bottom: 1px solid #222640;
+}
+tr.snippet-row mark {
+  background: var(--mark-bg);
+  color: var(--mark-fg);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* ── Content preview panel ─────────────────────────────────────────────── */
+tr.content-row td {
+  padding: 0;
+  border-bottom: 2px solid var(--border);
+}
+
+.content-panel {
+  background: #1c1e2e;
+  border-left: 3px solid var(--accent2);
+  padding: 10px 16px;
+  margin: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.6;
+}
+.content-panel.loading {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* ── Field help tooltip ────────────────────────────────────────────────── */
+.field-help {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+  display: none;
+}
+.field-help.visible { display: block; }
+.field-help code {
+  color: var(--cyan);
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+/* ── Keyboard shortcut hints ───────────────────────────────────────────── */
+.shortcuts {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 8px;
+}
+kbd {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 11px;
+}
+</style>
+</head>
+<body>
+
+<h1>fsearch <span>filesystem search</span></h1>
+
+<div id="search-form">
+  <div id="rows-container">
+    <!-- search rows inserted here -->
+  </div>
+
+  <div class="controls">
+    <button class="btn" onclick="doSearch()" title="Ctrl+Enter">Search</button>
+    <button class="btn btn-secondary" onclick="addRow()">+ Add row</button>
+    <button class="btn btn-secondary" onclick="sortRowsNotLast()" title="Move NOT rows to end">NOT&rarr;end</button>
+    <button class="btn btn-secondary" onclick="clearAll()">Clear</button>
+
+    <label>Limit
+      <input type="number" id="limit" value="50" min="1" max="500" style="width:60px">
+    </label>
+    <label>Sort
+      <select id="sort">
+        <option value="score desc">Relevance</option>
+        <option value="mtime desc">Newest first</option>
+        <option value="mtime asc">Oldest first</option>
+        <option value="size_bytes desc">Largest first</option>
+        <option value="size_bytes asc">Smallest first</option>
+        <option value="filename asc">Filename A-Z</option>
+      </select>
+    </label>
+    <label style="margin-left:auto">
+      <input type="checkbox" id="highlight" checked> Highlight
+    </label>
+  </div>
+</div>
+
+<div class="field-help" id="field-help">
+  <strong>Field reference:</strong>
+  <code>text</code> full-text &nbsp;
+  <code>name</code> filename glob (*.py) &nbsp;
+  <code>ext</code> extension (py,r — comma-sep) &nbsp;
+  <code>path</code> filepath (*auto-wildcard*) &nbsp;
+  <code>dir</code> directory (trailing / = prefix) &nbsp;
+  <code>content</code> file content &nbsp;
+  <code>size</code> &gt;10MB, &lt;1GB &nbsp;
+  <code>since</code> / <code>before</code> YYYY-MM-DD &nbsp;
+  <code>raw</code> raw Solr/Lucene query &nbsp;
+  | Regex: <code>/pattern/</code> in text, content, path
+</div>
+
+<div id="status"></div>
+
+<div id="results-area"></div>
+
+<div class="shortcuts">
+  <kbd>Ctrl</kbd>+<kbd>Enter</kbd> search &nbsp;
+  <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> add row &nbsp;
+  <kbd>?</kbd> toggle field help &nbsp;
+  Click a result row to load content preview
+</div>
+
+<script>
+// ── State ───────────────────────────────────────────────────────────────────
+let rowId = 0;
+let expandedPath = null;   // filepath of currently expanded content row
+
+const FIELDS = [
+  { value: "text",    label: "Text"    },
+  { value: "name",    label: "Name"    },
+  { value: "ext",     label: "Ext"     },
+  { value: "path",    label: "Path"    },
+  { value: "dir",     label: "Dir"     },
+  { value: "content", label: "Content" },
+  { value: "size",    label: "Size"    },
+  { value: "since",   label: "Since"   },
+  { value: "before",  label: "Before"  },
+  { value: "raw",     label: "Raw"     },
+];
+
+// ── Row management ──────────────────────────────────────────────────────────
+
+function createRowEl(id, isFirst) {
+  const div = document.createElement("div");
+  div.className = "search-row";
+  div.dataset.rowId = id;
+  div.draggable = true;
+
+  // Join operator (hidden on first row)
+  let joinHtml = `<select class="join-select" ${isFirst ? 'style="visibility:hidden"' : ''}>
+    <option value="AND">AND</option>
+    <option value="OR">OR</option>
+    <option value="NOT">NOT</option>
+  </select>`;
+
+  // Field selector
+  let fieldOpts = FIELDS.map(f =>
+    `<option value="${f.value}">${f.label}</option>`).join("");
+
+  div.innerHTML = `
+    <span class="drag-handle" title="Drag to reorder">&#x2630;</span>
+    ${joinHtml}
+    <select class="field-select">${fieldOpts}</select>
+    <input type="text" class="value-input" placeholder="value..."
+           onkeydown="if(event.ctrlKey && event.key==='Enter') doSearch()">
+    <button class="btn-icon btn-remove" onclick="removeRow(${id})" title="Remove">&times;</button>
+  `;
+
+  // Drag events
+  div.addEventListener("dragstart", onDragStart);
+  div.addEventListener("dragover",  onDragOver);
+  div.addEventListener("dragleave", onDragLeave);
+  div.addEventListener("drop",      onDrop);
+  div.addEventListener("dragend",   onDragEnd);
+
+  return div;
+}
+
+function addRow(field, value, join) {
+  const container = document.getElementById("rows-container");
+  const isFirst = container.children.length === 0;
+  const id = rowId++;
+  const el = createRowEl(id, isFirst);
+  container.appendChild(el);
+
+  if (field) el.querySelector(".field-select").value = field;
+  if (value) el.querySelector(".value-input").value = value;
+  if (join && !isFirst) el.querySelector(".join-select").value = join;
+
+  // Focus the new value input
+  el.querySelector(".value-input").focus();
+  updateJoinVisibility();
+}
+
+function removeRow(id) {
+  const container = document.getElementById("rows-container");
+  const el = container.querySelector(`[data-row-id="${id}"]`);
+  if (el) el.remove();
+  // Ensure at least one row
+  if (container.children.length === 0) addRow();
+  updateJoinVisibility();
+}
+
+function clearAll() {
+  document.getElementById("rows-container").innerHTML = "";
+  document.getElementById("results-area").innerHTML = "";
+  document.getElementById("status").innerHTML = "";
+  expandedPath = null;
+  addRow();
+}
+
+function updateJoinVisibility() {
+  const rows = document.querySelectorAll("#rows-container .search-row");
+  rows.forEach((row, i) => {
+    const sel = row.querySelector(".join-select");
+    if (sel) sel.style.visibility = i === 0 ? "hidden" : "visible";
+  });
+}
+
+function sortRowsNotLast() {
+  const container = document.getElementById("rows-container");
+  const rows = Array.from(container.querySelectorAll(".search-row"));
+  // Stable sort: NOT rows go to end, others keep order
+  rows.sort((a, b) => {
+    const aNot = a.querySelector(".join-select")?.value === "NOT" ? 1 : 0;
+    const bNot = b.querySelector(".join-select")?.value === "NOT" ? 1 : 0;
+    return aNot - bNot;
+  });
+  rows.forEach(r => container.appendChild(r));
+  updateJoinVisibility();
+}
+
+// ── Drag and drop reordering ────────────────────────────────────────────────
+
+let dragSrcEl = null;
+
+function onDragStart(e) {
+  dragSrcEl = this;
+  e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", this.dataset.rowId);
+  this.style.opacity = "0.4";
+}
+
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  this.classList.add("drag-over");
+}
+
+function onDragLeave(e) {
+  this.classList.remove("drag-over");
+}
+
+function onDrop(e) {
+  e.preventDefault();
+  this.classList.remove("drag-over");
+  if (dragSrcEl !== this) {
+    const container = document.getElementById("rows-container");
+    const rows = Array.from(container.children);
+    const srcIdx = rows.indexOf(dragSrcEl);
+    const dstIdx = rows.indexOf(this);
+    if (srcIdx < dstIdx) {
+      container.insertBefore(dragSrcEl, this.nextSibling);
+    } else {
+      container.insertBefore(dragSrcEl, this);
+    }
+    updateJoinVisibility();
+  }
+}
+
+function onDragEnd(e) {
+  this.style.opacity = "1";
+  document.querySelectorAll(".search-row").forEach(r => r.classList.remove("drag-over"));
+}
+
+// ── Collect rows → JSON ─────────────────────────────────────────────────────
+
+function getRows() {
+  const rows = [];
+  document.querySelectorAll("#rows-container .search-row").forEach((el, i) => {
+    const field = el.querySelector(".field-select").value;
+    const value = el.querySelector(".value-input").value.trim();
+    const join  = i === 0 ? "AND" : (el.querySelector(".join-select")?.value || "AND");
+    if (value) {
+      rows.push({ field, value, join, negate: join === "NOT" });
+    }
+  });
+  return rows;
+}
+
+// ── Search ──────────────────────────────────────────────────────────────────
+
+async function doSearch() {
+  const rows = getRows();
+  if (rows.length === 0) return;
+
+  const status = document.getElementById("status");
+  status.innerHTML = "Searching...";
+  expandedPath = null;
+
+  const payload = {
+    rows,
+    limit:     parseInt(document.getElementById("limit").value) || 50,
+    sort:      document.getElementById("sort").value,
+    highlight: document.getElementById("highlight").checked,
+  };
+
+  try {
+    const resp = await fetch("/api/search", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      status.innerHTML = `<span class="error">${escHtml(data.error)}</span>`;
+      return;
+    }
+
+    status.innerHTML = `Found <strong>${data.total}</strong> results` +
+      ` &mdash; <span class="query-text">${escHtml(data.query)}</span>`;
+    renderResults(data.docs);
+
+  } catch (e) {
+    status.innerHTML = `<span class="error">Request failed: ${escHtml(e.message)}</span>`;
+  }
+}
+
+// ── Render results ──────────────────────────────────────────────────────────
+
+function fmtSize(bytes) {
+  if (bytes == null) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = bytes;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i === 0 ? 0 : 1) + " " + units[i];
+}
+
+function fmtDate(s) {
+  return s ? s.substring(0, 10) : "";
+}
+
+function escHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function renderResults(docs) {
+  const area = document.getElementById("results-area");
+  if (!docs.length) {
+    area.innerHTML = `<p style="color:var(--text-dim); margin:12px 0">No results.</p>`;
+    return;
+  }
+
+  let html = `<table class="results">
+    <thead><tr>
+      <th style="width:55%">Path</th>
+      <th style="width:7%">Ext</th>
+      <th style="width:12%">Size</th>
+      <th style="width:12%">Modified</th>
+    </tr></thead><tbody>`;
+
+  docs.forEach((doc, idx) => {
+    const fp      = doc.filepath || "";
+    const ext     = doc.extension || "";
+    const sz      = fmtSize(doc.size_bytes);
+    const mt      = fmtDate(doc.mtime);
+    const hl      = doc.highlights || {};
+    const preview = doc.content_preview || "";
+
+    // Main result row
+    html += `<tr class="result-row" data-idx="${idx}" onclick="toggleContent(this)">
+      <td class="path-cell">${escHtml(fp)}</td>
+      <td class="ext-cell">${escHtml(ext)}</td>
+      <td class="size-cell">${sz}</td>
+      <td class="date-cell">${mt}</td>
+    </tr>`;
+
+    // Highlight snippet rows
+    for (const [field, snips] of Object.entries(hl)) {
+      for (const snip of snips) {
+        // snip already has <mark> tags from Solr — safe to inject
+        html += `<tr class="snippet-row"><td colspan="4">${snip}</td></tr>`;
+      }
+    }
+
+    // Content preview (hidden until clicked) — data already in hand, no API call needed
+    html += `<tr class="content-row" id="content-${idx}" style="display:none">
+      <td colspan="4">
+        <div class="content-panel">${preview ? escHtml(preview) : "(no content extracted)"}</div>
+      </td>
+    </tr>`;
+  });
+
+  html += `</tbody></table>`;
+  area.innerHTML = html;
+}
+
+// ── Content preview toggle ──────────────────────────────────────────────────
+
+function toggleContent(tr) {
+  // Find the content-row immediately following the snippets
+  let next = tr.nextElementSibling;
+  while (next && next.classList.contains("snippet-row")) {
+    next = next.nextElementSibling;
+  }
+  if (!next || !next.classList.contains("content-row")) return;
+
+  // Toggle off
+  if (next.style.display !== "none") {
+    next.style.display = "none";
+    tr.classList.remove("expanded");
+    return;
+  }
+
+  // Collapse any other expanded row
+  document.querySelectorAll("tr.content-row").forEach(r => r.style.display = "none");
+  document.querySelectorAll("tr.result-row.expanded").forEach(r => r.classList.remove("expanded"));
+
+  // Show — content_preview is already in the DOM from renderResults
+  next.style.display = "";
+  tr.classList.add("expanded");
+}
+
+// ── Keyboard shortcuts ──────────────────────────────────────────────────────
+
+document.addEventListener("keydown", (e) => {
+  // Ctrl+Enter: search
+  if (e.ctrlKey && e.key === "Enter") {
+    e.preventDefault();
+    doSearch();
+  }
+  // Ctrl+Shift+A: add row
+  if (e.ctrlKey && e.shiftKey && e.key === "A") {
+    e.preventDefault();
+    addRow();
+  }
+  // ? key (not in input): toggle field help
+  if (e.key === "?" && !["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) {
+    document.getElementById("field-help").classList.toggle("visible");
+  }
+});
+
+// ── Init ────────────────────────────────────────────────────────────────────
+addRow("text");
+</script>
+
+</body>
+</html>

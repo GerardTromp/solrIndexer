@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+*.log
+*.zip
+*.md5
+*.sha256
+
+# Generated files
+retryable.log
+permanent.log
