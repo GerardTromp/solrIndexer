@@ -26,6 +26,7 @@ console = Console(stderr=True)
 
 # Add file handler alongside RichHandler
 ERROR_LOG = Path("/mnt/wd1/solr/logs/index_errors.log")
+CORRUPT_LOG = Path("/mnt/wd1/solr/logs/corrupt_files.log")
 LOG_FILE = Path("/mnt/wd1/solr/logs/indexer.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 file_handler = logging.FileHandler(LOG_FILE)
@@ -175,9 +176,84 @@ def _device_cache_path(dev_id: int) -> Path:
     return FIND_CACHE.parent / f"{FIND_CACHE.stem}_dev{dev_id}{FIND_CACHE.suffix}"
 
 
+# ── Permanent skip list ──────────────────────────────────────────────────────
+# Lives alongside indexer state (~/.solr/), not in logs.
+# Files here will never have content extraction retried.
+
+SKIP_CONTENT_FILE = STATE_FILE.parent / "skip_content.tsv"
+
+# Error substrings that indicate permanent, unrecoverable extraction failure
+PERMANENT_REASONS = [
+    "EncryptedDocumentException",
+    "InvalidPasswordException",
+    "password",
+    "Missing root object",
+    "invalid cross reference",
+    "Unexpected EOF",
+    "NotOfficeXmlFileException",
+    "not a valid OOXML",
+    "OldWordFileFormatException",
+    "bomb",                         # zip bomb
+    "document is really a",         # format mismatch
+    "No valid entries or contents",
+    "file no longer exists",
+]
+
+_skip_content_set: set[str] | None = None   # lazy-loaded
+
+
+def _is_permanent_failure(reason: str) -> bool:
+    """True if the error reason indicates the file will never be extractable."""
+    reason_lower = reason.lower()
+    return any(marker.lower() in reason_lower for marker in PERMANENT_REASONS)
+
+
+def load_skip_content() -> set[str]:
+    """Load the permanent skip set from disk. Cached after first call."""
+    global _skip_content_set
+    if _skip_content_set is not None:
+        return _skip_content_set
+    _skip_content_set = set()
+    if SKIP_CONTENT_FILE.exists():
+        with open(SKIP_CONTENT_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                _skip_content_set.add(parts[0])
+    if _skip_content_set:
+        log.info(f"Loaded {len(_skip_content_set):,} permanently skipped files")
+    return _skip_content_set
+
+
+def add_to_skip_content(filepath: str, reason: str):
+    """Append a file to the permanent skip list and the corrupt files log."""
+    skip = load_skip_content()
+    if filepath in skip:
+        return
+    skip.add(filepath)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    SKIP_CONTENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SKIP_CONTENT_FILE, "a") as f:
+        f.write(f"{filepath}\t{ts}\t{reason}\n")
+    # Also log to corrupt_files.log for review / cleanup
+    with open(CORRUPT_LOG, "a") as f:
+        f.write(f"{ts}\t{reason}\t{filepath}\n")
+
+
+def should_skip_content(filepath: str) -> bool:
+    """True if this file is in the permanent skip list."""
+    return filepath in load_skip_content()
+
+
 # ── Log problem files  ──────────────────────────────────────────────────────
 
 def log_error(filepath: str, reason: str):
+    # If this is a permanent failure, add to skip list instead of error log
+    if _is_permanent_failure(reason):
+        add_to_skip_content(filepath, reason)
+        return
     with open(ERROR_LOG, "a") as f:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"{ts}\t{reason}\t{filepath}\n")
@@ -368,6 +444,8 @@ def extract_via_tika(path: Path, large: bool = False) -> str:
 
 
 def extract_content(path: Path, large_files: bool = False) -> str:
+    if should_skip_content(str(path)):
+        return ""
     ext = path.suffix.lower()
     try:
         if ext in TEXT_EXTS:
@@ -813,25 +891,62 @@ def cleanup_rotated_log(rotated: Path, had_errors: bool):
     log.info(f"Rotated log {rotated.name} cleaned up")
 
 def run_retry(solr_url: str, large_files: bool, dry_run: bool):
-    """Re-index files listed in the error log."""
+    """
+    Re-index files listed in the error log.
+    Triages each entry: permanent failures go to skip list,
+    transient failures are retried, and only still-failing transient
+    errors cycle back to the error log.
+    """
     rotated = rotate_error_log()
     if rotated is None:
         return
 
-    paths = read_error_log(rotated)
-    log.info(f"Retrying {len(paths)} previously failed files...")
+    # Read full entries (with reasons) for triage
+    entries = []
+    with open(rotated) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                entries.append((parts[0], parts[1], parts[2]))  # ts, reason, filepath
+
+    log.info(f"Triaging {len(entries)} error log entries...")
+
+    # First pass: separate permanent from retryable
+    retryable = []
+    permanent_count = 0
+    missing_count = 0
+
+    for ts, reason, filepath in entries:
+        if _is_permanent_failure(reason):
+            add_to_skip_content(filepath, reason)
+            permanent_count += 1
+        elif not Path(filepath).exists():
+            add_to_skip_content(filepath, "file no longer exists")
+            missing_count += 1
+        else:
+            retryable.append(filepath)
+
+    if permanent_count or missing_count:
+        log.info(f"Triaged: {permanent_count} permanent failures → skip list, "
+                 f"{missing_count} missing files → skip list, "
+                 f"{len(retryable)} to retry")
+
+    if not retryable:
+        log.info("No retryable files — nothing to do")
+        rotated.unlink()
+        return
+
+    # Second pass: retry the transient failures
+    log.info(f"Retrying {len(retryable)} previously failed files...")
 
     solr = pysolr.Solr(solr_url, always_commit=False, timeout=120)
     batch, ok_total, fail_total = [], 0, 0
 
-    for filepath in paths:
-        path = Path(filepath)
-        if not path.exists():
-            log.warning(f"No longer exists, skipping: {filepath}")
-            log_error(filepath, "file no longer exists at retry time")
-            fail_total += 1
-            continue
-        doc = file_to_doc(path, large_files=large_files)
+    for filepath in retryable:
+        doc = file_to_doc(Path(filepath), large_files=large_files)
         if doc:
             batch.append(doc)
         if len(batch) >= BATCH_SIZE:
@@ -848,6 +963,7 @@ def run_retry(solr_url: str, large_files: bool, dry_run: bool):
         solr.commit()
 
     log.info(f"Retry complete: {ok_total} succeeded, {fail_total} still failing")
+    # Only keep the rotated log data if transient failures remain
     cleanup_rotated_log(rotated, had_errors=fail_total > 0)
 
 # ── Core index routine ────────────────────────────────────────────────────────
