@@ -11,6 +11,7 @@ DATA_MOUNT="/mnt/wd1"
 SOLR_LOGS="$DATA_MOUNT/solr/logs"
 TIKA_JAR="$HOME/opt/tika-server.jar"
 FSEARCH_DIR="/opt/fsearch"
+TIKA_LOG4J="$FSEARCH_DIR/setup/tika-log4j2.xml"
 INDEX_ROOTS="/home/$USER /mnt/wd1/GT /mnt/d/GT"
 EXCLUDE_PATHS="/home/gerard/.cache /mnt/d/GT/Professional/NLM_CDE/work2/test_clustering /mnt/wd1/GT/NLM_CDE/cde_python"
 
@@ -56,7 +57,11 @@ start_tika() {
     fi
 
     echo "$(date): Starting Tika with -Xmx${heap}" | tee -a "$SOLR_LOGS/indexer.log"
-    nohup java -Xmx${heap} -jar "$TIKA_JAR" --port 9998 \
+    local log4j_arg=""
+    if [ -f "$TIKA_LOG4J" ]; then
+        log4j_arg="-Dlog4j2.configurationFile=$TIKA_LOG4J"
+    fi
+    nohup java -Xmx${heap} $log4j_arg -jar "$TIKA_JAR" --port 9998 \
         >> "$SOLR_LOGS/tika.log" 2>&1 &
 
     echo "Waiting for Tika to be ready..."

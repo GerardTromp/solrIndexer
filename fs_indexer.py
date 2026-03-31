@@ -5,6 +5,7 @@ Deps: pip install pysolr tika requests click rich
 """
 
 import gc
+import multiprocessing
 import os, sys, stat, signal, mimetypes, datetime, time, json, logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,19 +53,16 @@ LOCK_FILE = Path(os.environ.get("FSEARCH_LOCK", "/mnt/wd1/solr/indexer.lock"))
 _shutdown_requested = False
 
 def _handle_signal(signum, frame):
+    """Signal handler for the worker (child) process."""
     global _shutdown_requested
     name = signal.Signals(signum).name
     if _shutdown_requested:
-        # Second signal — force exit immediately
         log.warning(f"Received {name} again — forcing immediate exit")
         release_lock()
         os._exit(1)
     log.warning(f"Received {name} — finishing current file then stopping "
                 f"(send again to force-quit)")
     _shutdown_requested = True
-
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
 
 
 def acquire_lock() -> bool:
@@ -199,6 +197,7 @@ def save_state(state: dict):
 
 TIKA_JAR = os.environ.get("TIKA_JAR", str(Path.home() / "opt" / "tika-server.jar"))
 TIKA_LOG = Path(os.environ.get("TIKA_LOG", "/mnt/wd1/solr/logs/tika.log"))
+TIKA_LOG4J = os.environ.get("TIKA_LOG4J", "/opt/fsearch/setup/tika-log4j2.xml")
 TIKA_PORT = int(TIKA_URL.rsplit(":", 1)[-1].split("/")[0]) if ":" in TIKA_URL else 9998
 
 _tika_consecutive_failures = 0
@@ -253,9 +252,13 @@ def _restart_tika() -> bool:
 
     # Start Tika
     TIKA_LOG.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["java"]
+    if Path(TIKA_LOG4J).exists():
+        cmd.append(f"-Dlog4j2.configurationFile={TIKA_LOG4J}")
+    cmd += ["-jar", TIKA_JAR, "--port", str(TIKA_PORT)]
     with open(TIKA_LOG, "a") as tlog:
         subprocess.Popen(
-            ["java", "-jar", TIKA_JAR, "--port", str(TIKA_PORT)],
+            cmd,
             stdout=tlog, stderr=tlog,
             start_new_session=True,
         )
@@ -639,14 +642,65 @@ def _file_unchanged(path: Path, indexed_meta: dict[str, tuple[int, str]]) -> boo
 
 # ── Delete pass: remove Solr docs for files that no longer exist ─────────────
 
-def purge_deleted(solr: pysolr.Solr, batch_size: int = 1000):
+def _build_existing_set(roots: list[Path], exclude: set[Path]) -> set[str]:
     """
-    Page through all indexed filepaths; delete docs whose file is gone.
-    Runs after the index pass. Efficient: no content re-read.
+    Fast filesystem scan that only collects paths (no stat, no content).
+    Returns a set of filepath strings for existence checking.
+    Uses os.scandir recursively — much faster than individual Path.exists()
+    calls because it reads directories sequentially (cache-friendly I/O).
     """
-    log.info("Running delete pass...")
+    import subprocess
+
+    log.info("Building filesystem snapshot for purge pass...")
+    existing: set[str] = set()
+
+    for root in roots:
+        if _shutdown_requested:
+            break
+        # Use find -type f for speed — one process per root, sequential dir reads
+        exclude_args = []
+        for ex in exclude:
+            exclude_args += ["-path", str(ex), "-prune", "-o"]
+        for skip in SKIP_DIRS:
+            exclude_args += ["-name", skip, "-prune", "-o"]
+
+        cmd = ["find", str(root)] + exclude_args + ["-type", "f", "-print0"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=600)
+            for fp in result.stdout.split(b"\0"):
+                if fp:
+                    existing.add(fp.decode("utf-8", errors="replace"))
+        except subprocess.TimeoutExpired:
+            log.warning(f"Find timed out for {root} — falling back to partial snapshot")
+        except Exception as e:
+            log.warning(f"Find failed for {root}: {e}")
+
+    log.info(f"Filesystem snapshot: {len(existing):,} files found")
+    return existing
+
+
+def purge_deleted(solr: pysolr.Solr, roots: list[Path] = None,
+                  exclude: set[Path] = None, batch_size: int = 1000):
+    """
+    Delete Solr docs for files that no longer exist on disk.
+
+    If roots/exclude are provided, builds a fast filesystem snapshot first
+    and uses set membership for O(1) lookups (instead of one stat per doc).
+    Falls back to per-file Path.exists() if roots are not available.
+    """
+    # Build snapshot if we have roots
+    if roots and not _shutdown_requested:
+        existing = _build_existing_set(roots, exclude or set())
+        use_snapshot = True
+    else:
+        existing = None
+        use_snapshot = False
+
+    log.info("Running delete pass%s...",
+             f" ({len(existing):,} files in snapshot)" if use_snapshot else "")
     cursor = "*"
     deleted = 0
+
     while True:
         if _shutdown_requested:
             log.info(f"Shutdown — aborting delete pass (purged {deleted} so far)")
@@ -656,7 +710,11 @@ def purge_deleted(solr: pysolr.Solr, batch_size: int = 1000):
                               rows=batch_size,
                               sort="id asc",
                               cursorMark=cursor)
-        to_delete = [r["id"] for r in results if not Path(r["id"]).exists()]
+        if use_snapshot:
+            to_delete = [r["id"] for r in results if r["id"] not in existing]
+        else:
+            to_delete = [r["id"] for r in results if not Path(r["id"]).exists()]
+
         if to_delete:
             solr.delete(id=to_delete)
             deleted += len(to_delete)
@@ -1009,7 +1067,7 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
     if not dry_run:
         solr_cleanup = pysolr.Solr(solr_url, always_commit=False, timeout=120)
         if not no_purge:
-            purge_deleted(solr_cleanup)
+            purge_deleted(solr_cleanup, roots=roots_p, exclude=exclude)
         for cache in dev_caches.values():
             clear_checkpoint(cache)
             cache.unlink(missing_ok=True)
@@ -1031,6 +1089,7 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
 @click.option("--full",     is_flag=True, help="Force full re-index (ignore last_run)")
 @click.option("--rebuild",  is_flag=True, help="Delete all Solr documents and re-index from scratch")
 @click.option("--no-purge", is_flag=True, help="Skip the deleted-files purge pass")
+@click.option("--purge-only", is_flag=True, help="Run only the delete pass (no indexing)")
 @click.option("--dry-run",  is_flag=True, help="Parse and extract but don't write to Solr")
 @click.option("--solr-url", default=SOLR_URL, show_default=True)
 @click.option("--large-files", is_flag=True, default=False,
@@ -1042,7 +1101,99 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
               help="Stop a running indexer gracefully (sends SIGTERM)")
 @click.option("--status", is_flag=True, default=False,
               help="Check if an indexer is currently running")
-def main(roots, exclude, full, rebuild, no_purge, dry_run, solr_url, large_files, retry_errors, stop, status):
+def _worker(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
+            solr_url, large_files, retry_errors):
+    """
+    Worker function — runs in a child process.
+    Installs signal handlers and does all the actual indexing work.
+    """
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    try:
+        if purge_only:
+            if not roots:
+                raise click.UsageError("ROOTS required for --purge-only")
+            roots_p = [Path(r) for r in roots]
+            exclude_set = {Path(e).resolve() for e in exclude}
+            solr = pysolr.Solr(solr_url, always_commit=False, timeout=120)
+            purge_deleted(solr, roots=roots_p, exclude=exclude_set)
+            return
+
+        if retry_errors:
+            run_retry(solr_url=solr_url, large_files=large_files, dry_run=dry_run)
+            if not roots:
+                return
+
+        if roots:
+            run_index(
+                roots, exclude,
+                incremental=not full and not rebuild,
+                no_purge=no_purge,
+                solr_url=solr_url,
+                dry_run=dry_run,
+                large_files=large_files,
+                rebuild=rebuild,
+            )
+        elif not retry_errors:
+            raise click.UsageError("ROOTS required unless --retry-errors or --stop is used")
+    finally:
+        release_lock()
+
+
+def _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
+                  solr_url, large_files, retry_errors):
+    """
+    Fork a child process to do the work. The parent supervises and handles
+    SIGTERM by killing the child — this works even when the child is blocked
+    in a C-level call (HTTP request, subprocess, etc.).
+    """
+    child = multiprocessing.Process(
+        target=_worker,
+        args=(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
+              solr_url, large_files, retry_errors),
+        daemon=False,
+    )
+    child.start()
+
+    # Write the CHILD's PID to the lockfile — this is the PID that --stop targets
+    LOCK_FILE.write_text(str(child.pid))
+    log.info(f"Worker started (PID {child.pid})")
+
+    # Parent signal handler: forward to child, then escalate
+    def _parent_signal(signum, frame):
+        name = signal.Signals(signum).name
+        if child.is_alive():
+            log.info(f"Received {name} — sending to worker PID {child.pid}")
+            os.kill(child.pid, signum)
+            # Give child a few seconds to finish gracefully
+            child.join(timeout=5)
+            if child.is_alive():
+                log.warning(f"Worker did not stop — sending SIGKILL")
+                child.kill()
+                child.join(timeout=5)
+        release_lock()
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, _parent_signal)
+    signal.signal(signal.SIGINT, _parent_signal)
+
+    # Wait for child to finish
+    child.join()
+
+    # Clean up lock if child exited without releasing (crash, kill, etc.)
+    if LOCK_FILE.exists():
+        try:
+            lock_pid = int(LOCK_FILE.read_text().strip())
+            if lock_pid == child.pid:
+                LOCK_FILE.unlink()
+        except (ValueError, OSError):
+            pass
+
+    sys.exit(child.exitcode or 0)
+
+
+def main(roots, exclude, full, rebuild, no_purge, purge_only, dry_run, solr_url, large_files, retry_errors, stop, status):
     """Crawl ROOT paths and index (or incrementally update) Solr."""
     if stop:
         stop_running_indexer()
@@ -1063,26 +1214,9 @@ def main(roots, exclude, full, rebuild, no_purge, dry_run, solr_url, large_files
     if not acquire_lock():
         sys.exit(1)
 
-    try:
-        if retry_errors:
-            run_retry(solr_url=solr_url, large_files=large_files, dry_run=dry_run)
-            if not roots:
-                return   # retry-only mode, no crawl
+    _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
+                  solr_url, large_files, retry_errors)
 
-        if roots:
-            run_index(
-                roots, exclude,
-                incremental=not full and not rebuild,
-                no_purge=no_purge,
-                solr_url=solr_url,
-                dry_run=dry_run,
-                large_files=large_files,
-                rebuild=rebuild,
-            )
-        elif not retry_errors:
-            raise click.UsageError("ROOTS required unless --retry-errors or --stop is used")
-    finally:
-        release_lock()
 
 if __name__ == "__main__":
     main()

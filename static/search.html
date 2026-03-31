@@ -333,6 +333,7 @@ kbd {
 // ── State ───────────────────────────────────────────────────────────────────
 let rowId = 0;
 let expandedPath = null;   // filepath of currently expanded content row
+let lastQuery = "";        // last generated Solr query
 
 const FIELDS = [
   { value: "text",    label: "Text"    },
@@ -527,8 +528,11 @@ async function doSearch() {
       return;
     }
 
+    lastQuery = data.query;
     status.innerHTML = `Found <strong>${data.total}</strong> results` +
-      ` &mdash; <span class="query-text">${escHtml(data.query)}</span>`;
+      ` &mdash; <span class="query-text">${escHtml(data.query)}</span>` +
+      ` <button class="btn-icon" onclick="copyQuery()" title="Copy query for fsearch -q">&#x2398;</button>` +
+      ` <button class="btn-icon" onclick="copyCli()" title="Copy full fsearch command">cli</button>`;
     renderResults(data.docs);
 
   } catch (e) {
@@ -631,6 +635,36 @@ function toggleContent(tr) {
   // Show — content_preview is already in the DOM from renderResults
   next.style.display = "";
   tr.classList.add("expanded");
+}
+
+// ── Copy query to clipboard ─────────────────────────────────────────────────
+
+function copyQuery() {
+  if (!lastQuery) return;
+  navigator.clipboard.writeText(lastQuery).then(() => {
+    flashStatus("Query copied to clipboard");
+  });
+}
+
+function copyCli() {
+  if (!lastQuery) return;
+  // Escape single quotes for shell
+  const escaped = lastQuery.replace(/'/g, "'\\''");
+  const limit = document.getElementById("limit").value;
+  const sort = document.getElementById("sort").value;
+  let cmd = `fsearch -q '${escaped}'`;
+  if (limit !== "50") cmd += ` -l ${limit}`;
+  if (sort !== "score desc") cmd += ` --sort '${sort}'`;
+  navigator.clipboard.writeText(cmd).then(() => {
+    flashStatus("CLI command copied to clipboard");
+  });
+}
+
+function flashStatus(msg) {
+  const status = document.getElementById("status");
+  const prev = status.innerHTML;
+  status.innerHTML = `<span style="color:var(--green)">${msg}</span>`;
+  setTimeout(() => { status.innerHTML = prev; }, 1500);
 }
 
 // ── Keyboard shortcuts ──────────────────────────────────────────────────────
