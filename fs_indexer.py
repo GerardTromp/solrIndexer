@@ -680,7 +680,7 @@ def _build_existing_set(roots: list[Path], exclude: set[Path]) -> set[str]:
 
 
 def purge_deleted(solr: pysolr.Solr, roots: list[Path] = None,
-                  exclude: set[Path] = None, batch_size: int = 1000):
+                  exclude: set[Path] = None, batch_size: int = 50000):
     """
     Delete Solr docs for files that no longer exist on disk.
 
@@ -1083,24 +1083,6 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-@click.command()
-@click.argument("roots", nargs=-1, required=False)
-@click.option("-x","--exclude", multiple=True, help="Paths to exclude")
-@click.option("--full",     is_flag=True, help="Force full re-index (ignore last_run)")
-@click.option("--rebuild",  is_flag=True, help="Delete all Solr documents and re-index from scratch")
-@click.option("--no-purge", is_flag=True, help="Skip the deleted-files purge pass")
-@click.option("--purge-only", is_flag=True, help="Run only the delete pass (no indexing)")
-@click.option("--dry-run",  is_flag=True, help="Parse and extract but don't write to Solr")
-@click.option("--solr-url", default=SOLR_URL, show_default=True)
-@click.option("--large-files", is_flag=True, default=False,
-              help=f"Extract content from files >{MAX_TEXT_SIZE//1024//1024}MB "
-                   f"(slower, longer Tika timeout of {LARGE_TIKA_TIMEOUT}s)")
-@click.option("--retry-errors", is_flag=True, default=False,
-              help="Re-index files from the error log, then clear it")
-@click.option("--stop", is_flag=True, default=False,
-              help="Stop a running indexer gracefully (sends SIGTERM)")
-@click.option("--status", is_flag=True, default=False,
-              help="Check if an indexer is currently running")
 def _worker(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
             solr_url, large_files, retry_errors):
     """
@@ -1193,6 +1175,24 @@ def _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
     sys.exit(child.exitcode or 0)
 
 
+@click.command()
+@click.argument("roots", nargs=-1, required=False)
+@click.option("-x","--exclude", multiple=True, help="Paths to exclude")
+@click.option("--full",     is_flag=True, help="Force full re-index (ignore last_run)")
+@click.option("--rebuild",  is_flag=True, help="Delete all Solr documents and re-index from scratch")
+@click.option("--no-purge", is_flag=True, help="Skip the deleted-files purge pass")
+@click.option("--purge-only", is_flag=True, help="Run only the delete pass (no indexing)")
+@click.option("--dry-run",  is_flag=True, help="Parse and extract but don't write to Solr")
+@click.option("--solr-url", default=SOLR_URL, show_default=True)
+@click.option("--large-files", is_flag=True, default=False,
+              help=f"Extract content from files >{MAX_TEXT_SIZE//1024//1024}MB "
+                   f"(slower, longer Tika timeout of {LARGE_TIKA_TIMEOUT}s)")
+@click.option("--retry-errors", is_flag=True, default=False,
+              help="Re-index files from the error log, then clear it")
+@click.option("--stop", is_flag=True, default=False,
+              help="Stop a running indexer gracefully (sends SIGTERM)")
+@click.option("--status", is_flag=True, default=False,
+              help="Check if an indexer is currently running")
 def main(roots, exclude, full, rebuild, no_purge, purge_only, dry_run, solr_url, large_files, retry_errors, stop, status):
     """Crawl ROOT paths and index (or incrementally update) Solr."""
     if stop:

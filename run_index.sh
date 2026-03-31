@@ -3,6 +3,8 @@
 # Ensures Tika is running, then runs the indexer.
 # Also retries previously failed files before the main crawl.
 #
+# Cron provides a minimal environment — set PATH explicitly
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/fsearch"
 # Usage:
 #   run_index.sh                    # normal run (Tika at default 512m heap)
 #   run_index.sh --tika-heap 4g     # temporarily boost Tika heap for large files
@@ -88,9 +90,17 @@ stop_tika() {
 
 # ── Check data mount ────────────────────────────────────────────────────────
 
-if ! mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
-    echo "$(date): ERROR — $DATA_MOUNT not mounted, aborting" >> "$SOLR_LOGS/indexer.log"
-    exit 1
+# Verify data mount is accessible — use directory test rather than mountpoint
+# which can fail in WSL2 cron's mount namespace
+if [ ! -d "$DATA_MOUNT/solr" ]; then
+    # Try explicit mount in case cron doesn't see it
+    mount -a 2>/dev/null
+    sleep 2
+    if [ ! -d "$DATA_MOUNT/solr" ]; then
+        echo "$(date): ERROR — $DATA_MOUNT not accessible, aborting" >> "$SOLR_LOGS/indexer.log" 2>/dev/null || \
+            echo "$(date): ERROR — $DATA_MOUNT not accessible, aborting" >&2
+        exit 1
+    fi
 fi
 
 # ── Rotate logs ────────────────────────────────────────────────────────────
