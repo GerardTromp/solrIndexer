@@ -8,6 +8,9 @@ __pycache__/
 *.md5
 *.sha256
 
+# settings files
+settings.json
+
 # Generated files
 retryable.log
 permanent.log
