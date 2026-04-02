@@ -184,6 +184,7 @@ SKIP_CONTENT_FILE = STATE_FILE.parent / "skip_content.tsv"
 
 # Error substrings that indicate permanent, unrecoverable extraction failure
 PERMANENT_REASONS = [
+    "HTTP 422",                     # Tika actively rejected the file
     "EncryptedDocumentException",
     "InvalidPasswordException",
     "password",
@@ -480,6 +481,8 @@ def ts_to_solr(ts: float) -> str:
 
 def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
     try:
+        if path.name.startswith("~$"):   # Office lock/temp files — always garbage
+            return None
         s = path.stat()
         if stat.S_ISLNK(s.st_mode):   # skip symlinks to avoid loops
             return None
