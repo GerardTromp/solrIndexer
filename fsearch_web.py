@@ -18,6 +18,7 @@ from flask import Flask, request, jsonify, send_from_directory
 import pysolr
 
 SOLR_URL = os.environ.get("SOLR_URL", "http://localhost:8983/solr/filesystem")
+HERE = Path(__file__).resolve().parent
 
 app = Flask(__name__, static_folder=None)
 
@@ -162,8 +163,7 @@ def build_query_from_rows(rows: list[dict], default_join: str = "AND") -> str:
 
 @app.route("/")
 def index():
-    return send_from_directory(
-        os.path.join(os.path.dirname(__file__), "static"), "search.html")
+    return send_from_directory(str(HERE / "static"), "search.html")
 
 
 @app.route("/api/search", methods=["POST"])

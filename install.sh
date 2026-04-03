@@ -77,8 +77,10 @@ EOF
 echo "==> Installing fsearch scripts to ${FSEARCH_DIR}..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 sudo mkdir -p "$FSEARCH_DIR"
-sudo cp "$SCRIPT_DIR/fs_indexer.py" "$SCRIPT_DIR/fsearch.py" "$SCRIPT_DIR/run_index.sh" "$FSEARCH_DIR/"
-sudo chmod +x "$FSEARCH_DIR/run_index.sh" "$FSEARCH_DIR/fsearch.py" "$FSEARCH_DIR/fs_indexer.py"
+sudo cp "$SCRIPT_DIR/fs_indexer.py" "$SCRIPT_DIR/fsearch.py" "$SCRIPT_DIR/fsearch_web.py" "$SCRIPT_DIR/run_index.sh" "$FSEARCH_DIR/"
+sudo mkdir -p "$FSEARCH_DIR/static"
+sudo cp "$SCRIPT_DIR/static/search.html" "$FSEARCH_DIR/static/"
+sudo chmod +x "$FSEARCH_DIR/run_index.sh" "$FSEARCH_DIR/fsearch.py" "$FSEARCH_DIR/fs_indexer.py" "$FSEARCH_DIR/fsearch_web.py"
 
 # Symlink fsearch to PATH
 sudo ln -sf "$FSEARCH_DIR/fsearch.py" /usr/local/bin/fsearch
