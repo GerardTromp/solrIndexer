@@ -15,6 +15,8 @@ from typing import Generator
 import click
 import pysolr
 import requests
+
+from fsearch_hash import sha256_file
 from rich.progress import Progress, SpinnerColumn, TextColumn, MofNCompleteColumn
 from rich.logging import RichHandler
 from rich.console import Console
@@ -489,7 +491,8 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
         ext = path.suffix.lower()
         mime, _ = mimetypes.guess_type(str(path))
         content = extract_content(path, large_files=large_files)
-        return {
+        sha = sha256_file(path, large_files=large_files)
+        doc = {
             "id":              str(path),
             "filepath":        str(path),
             "filename":        path.name,
@@ -502,6 +505,9 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
             "content_preview": content[:CONTENT_PREVIEW] if content else "",
             "owner":           str(s.st_uid),
         }
+        if sha:
+            doc["content_sha256"] = sha
+        return doc
     except (PermissionError, FileNotFoundError, OSError) as e:
         log.debug(f"Skipping {path}: {e}")
         return None
@@ -680,43 +686,57 @@ def crawl_from_cache(cache: Path = FIND_CACHE) -> Generator[Path, None, None]:
 
 # ── Skip-if-unchanged: avoid re-indexing files Solr already has ──────────────
 
-def fetch_indexed_meta(solr: pysolr.Solr) -> dict[str, tuple[int, str]]:
+def fetch_indexed_meta(solr: pysolr.Solr) -> dict[str, tuple[int, str, bool]]:
     """
-    Bulk-fetch (size_bytes, mtime) for every indexed document.
-    Returns {filepath: (size_bytes, mtime_solr_str)}.
-    Used to skip re-indexing unchanged files.
+    Bulk-fetch (size_bytes, mtime, has_sha256) for every indexed document.
+    Returns {filepath: (size_bytes, mtime_solr_str, has_sha256)}.
+    Used to skip re-indexing unchanged files. A file is treated as
+    "unchanged" only if size+mtime match AND the doc already has a
+    content_sha256 — this lets a normal --full run backfill hashes into
+    previously-indexed docs that lack them, without touching docs that
+    already carry one.
     """
     log.info("Loading indexed file metadata from Solr for change detection...")
-    meta: dict[str, tuple[int, str]] = {}
+    meta: dict[str, tuple[int, str, bool]] = {}
     cursor = "*"
     while True:
         if _shutdown_requested:
             log.info("Shutdown — aborting metadata fetch, will skip change detection")
             return {}
         results = solr.search("*:*",
-                              fl="id,size_bytes,mtime",
+                              fl="id,size_bytes,mtime,content_sha256",
                               rows=5000,
                               sort="id asc",
                               cursorMark=cursor)
         for r in results:
-            meta[r["id"]] = (r.get("size_bytes", -1), r.get("mtime", ""))
+            meta[r["id"]] = (r.get("size_bytes", -1),
+                             r.get("mtime", ""),
+                             bool(r.get("content_sha256")))
         new_cursor = results.nextCursorMark
         if new_cursor == cursor:
             break
         cursor = new_cursor
-    log.info(f"Loaded metadata for {len(meta):,} indexed files")
+    with_hash = sum(1 for v in meta.values() if v[2])
+    log.info(f"Loaded metadata for {len(meta):,} indexed files "
+             f"({with_hash:,} already hashed, {len(meta) - with_hash:,} need backfill)")
     return meta
 
 
-def _file_unchanged(path: Path, indexed_meta: dict[str, tuple[int, str]]) -> bool:
-    """True if file's current size and mtime match what Solr already has."""
+def _file_unchanged(path: Path, indexed_meta: dict[str, tuple[int, str, bool]]) -> bool:
+    """
+    True if the file's current size and mtime match what Solr already has
+    AND the indexed doc already has a content_sha256. The hash check lets
+    a --full (or any) run backfill hashes into older docs that lack one.
+    """
     key = str(path)
     if key not in indexed_meta:
         return False
     try:
         s = path.stat()
-        idx_size, idx_mtime = indexed_meta[key]
-        return s.st_size == idx_size and ts_to_solr(s.st_mtime) == idx_mtime
+        idx_size, idx_mtime, has_hash = indexed_meta[key]
+        return (s.st_size == idx_size
+                and ts_to_solr(s.st_mtime) == idx_mtime
+                and has_hash)
     except OSError:
         return False
 
@@ -973,7 +993,7 @@ def run_retry(solr_url: str, large_files: bool, dry_run: bool):
 
 def _index_device_group(dev_id: int, cache: Path, solr_url: str,
                         dry_run: bool, large_files: bool,
-                        indexed_meta: dict[str, tuple[int, str]] | None = None,
+                        indexed_meta: dict[str, tuple[int, str, bool]] | None = None,
                         ) -> tuple[int, int, int, int]:
     """
     Index all files from a single device's find cache.

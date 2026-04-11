@@ -16,7 +16,7 @@ FSEARCH_DIR="${FSEARCH_DIR:-/opt/fsearch}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WHAT="${1:-all}"
 
-SCRIPTS=(fs_indexer.py fsearch.py fsearch_web.py run_index.sh triage_errors.py)
+SCRIPTS=(fs_indexer.py fsearch.py fsearch_web.py fsearch_hash.py run_index.sh triage_errors.py)
 
 if [[ ! -d "$FSEARCH_DIR" ]]; then
     echo "ERROR: $FSEARCH_DIR does not exist. Run install.sh first." >&2

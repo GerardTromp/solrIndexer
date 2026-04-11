@@ -35,7 +35,8 @@ curl -s -X POST "${SOLR_BASE}/schema" \
     {"name":"mimetype",       "type":"string",       "stored":true,  "indexed":true},
     {"name":"content",        "type":"text_general",  "stored":false, "indexed":true},
     {"name":"content_preview", "type":"text_general",   "stored":true,  "indexed":true},
-    {"name":"owner",          "type":"string",       "stored":true,  "indexed":false}
+    {"name":"owner",          "type":"string",       "stored":true,  "indexed":false},
+    {"name":"content_sha256", "type":"string",       "stored":true,  "indexed":true}
   ],
   "add-copy-field": [
     {"source":"filename", "dest":"filename_exact"},

@@ -195,6 +195,27 @@ td.path-cell {
   color: var(--green);
   max-width: 0;   /* allow table column to shrink */
 }
+td.path-cell .path-text { display: inline; }
+td.path-cell .row-actions {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: 6px;
+  opacity: 0;
+  transition: opacity 0.12s;
+  vertical-align: middle;
+}
+tr.result-row:hover td.path-cell .row-actions,
+tr.result-row.expanded td.path-cell .row-actions { opacity: 1; }
+.row-actions .btn-icon {
+  font-size: 12px;
+  padding: 1px 5px;
+  color: var(--text-dim);
+}
+.row-actions .btn-icon:hover {
+  color: var(--accent);
+  background: var(--bg);
+  border-color: var(--border);
+}
 td.ext-cell  { color: var(--orange); white-space: nowrap; }
 td.size-cell { text-align: right; white-space: nowrap; color: var(--cyan); }
 td.date-cell { white-space: nowrap; }
@@ -567,6 +588,46 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
+// Translate WSL-style paths to Windows-style for vscode:// and file:// URIs.
+// /mnt/d/GT/foo  -> d:/GT/foo
+// Anything else passes through unchanged.
+function wslToWindows(p) {
+  const m = /^\/mnt\/([a-z])\/(.*)$/i.exec(p);
+  return m ? `${m[1].toLowerCase()}:/${m[2]}` : p;
+}
+
+function parentDir(p) {
+  const i = p.lastIndexOf("/");
+  return i > 0 ? p.substring(0, i) : p;
+}
+
+function copyToClipboard(text, msg) {
+  navigator.clipboard.writeText(text).then(
+    () => flashStatus(msg || "Copied to clipboard"),
+    () => flashStatus("Clipboard write failed"));
+}
+
+function openInVSCode(fp) {
+  const winPath = wslToWindows(fp);
+  // vscode://file/<absolute path> — handler is registered system-wide
+  // on Windows, so this works when served to a Windows browser.
+  window.location.href = "vscode://file/" + winPath;
+  flashStatus("Opening in VS Code\u2026");
+}
+
+function openFolder(fp) {
+  // Browsers block file:// navigation from http:// origins, so we
+  // copy the folder path to clipboard and let the user paste into
+  // Explorer / Finder / a terminal.
+  const winDir = wslToWindows(parentDir(fp));
+  copyToClipboard(winDir, `Folder path copied: ${winDir}`);
+}
+
+function copyPath(fp) {
+  const winPath = wslToWindows(fp);
+  copyToClipboard(winPath, `Path copied: ${winPath}`);
+}
+
 function renderResults(docs) {
   const area = document.getElementById("results-area");
   if (!docs.length) {
@@ -590,9 +651,18 @@ function renderResults(docs) {
     const hl      = doc.highlights || {};
     const preview = doc.content_preview || "";
 
-    // Main result row
+    // Main result row. Path is carried via data-filepath (set after insert
+    // via textContent to avoid HTML-escaping pitfalls); action buttons are
+    // wired by event delegation in renderResults().
+    const hasHash = !!doc.content_sha256;
+    const actions = `<span class="row-actions">
+      <button class="btn-icon" data-action="copy"   title="Copy path">&#x2398;</button>
+      <button class="btn-icon" data-action="vscode" title="Open in VS Code">&lt;/&gt;</button>
+      <button class="btn-icon" data-action="folder" title="Copy folder path">&#x1F4C1;</button>
+      ${hasHash ? `<button class="btn-icon" data-action="dupes" title="Find duplicates of this file">&#x29C9;</button>` : ""}
+    </span>`;
     html += `<tr class="result-row" data-idx="${idx}" onclick="toggleContent(this)">
-      <td class="path-cell">${escHtml(fp)}</td>
+      <td class="path-cell"><span class="path-text">${escHtml(fp)}</span>${actions}</td>
       <td class="ext-cell">${escHtml(ext)}</td>
       <td class="size-cell">${sz}</td>
       <td class="date-cell">${mt}</td>
@@ -616,6 +686,48 @@ function renderResults(docs) {
 
   html += `</tbody></table>`;
   area.innerHTML = html;
+
+  // Attach filepath as a JS property (not attribute) per row and wire
+  // delegated click handler on each action button. Using a property avoids
+  // HTML-escaping issues with paths containing quotes / ampersands / etc.
+  const rows = area.querySelectorAll("tr.result-row");
+  rows.forEach((tr, i) => {
+    const doc = docs[i];
+    tr._filepath = doc.filepath || "";
+    tr._sha256   = doc.content_sha256 || "";
+  });
+  area.querySelectorAll(".row-actions .btn-icon").forEach(btn => {
+    btn.addEventListener("click", handleRowAction);
+  });
+}
+
+function handleRowAction(ev) {
+  ev.stopPropagation();
+  const btn = ev.currentTarget;
+  const tr = btn.closest("tr.result-row");
+  if (!tr) return;
+  const fp = tr._filepath || "";
+  switch (btn.dataset.action) {
+    case "copy":   copyPath(fp);              break;
+    case "vscode": openInVSCode(fp);          break;
+    case "folder": openFolder(fp);            break;
+    case "dupes":  findDuplicates(tr._sha256); break;
+  }
+}
+
+async function findDuplicates(hash) {
+  if (!hash) {
+    flashStatus("No hash available for this file");
+    return;
+  }
+  // Replace the first row with a raw-query row for content_sha256, then
+  // run the normal search path so results render in the standard table.
+  clearAll();
+  const container = document.getElementById("rows-container");
+  const row = container.querySelector(".search-row");
+  row.querySelector(".field-select").value = "raw";
+  row.querySelector(".value-input").value  = `content_sha256:"${hash}"`;
+  doSearch();
 }
 
 // ── Content preview toggle ──────────────────────────────────────────────────

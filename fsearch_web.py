@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 import pysolr
 
 EXPORT_COLUMNS = ["filepath", "filename", "extension", "size_bytes",
-                  "mtime", "directory"]
+                  "mtime", "directory", "content_sha256"]
 EXPORT_MAX_ROWS = 100_000
 
 SOLR_URL = os.environ.get("SOLR_URL", "http://localhost:8983/solr/filesystem")
@@ -186,7 +186,7 @@ def api_search():
     solr = pysolr.Solr(body.get("solr_url", SOLR_URL), timeout=15)
 
     params = {
-        "fl": "filepath,filename,size_bytes,mtime,extension,directory,content_preview",
+        "fl": "filepath,filename,size_bytes,mtime,extension,directory,content_preview,content_sha256",
         "rows": limit,
         "sort": sort,
     }
@@ -283,6 +283,55 @@ def api_export():
         mimetype="application/json",
         headers={"Content-Disposition":
                  f'attachment; filename="fsearch_{ts}.json"'})
+
+
+@app.route("/api/duplicates", methods=["POST"])
+def api_duplicates():
+    """
+    Find duplicate files by content_sha256.
+
+    Body (either form):
+      {"hash": "<sha256 hex>"}         → return all docs with that hash
+      {"min_count": 2, "limit": 100}   → return groups sharing a hash
+    """
+    body = request.get_json(force=True)
+    solr = pysolr.Solr(body.get("solr_url", SOLR_URL), timeout=30)
+
+    # Mode 1: lookup by specific hash
+    if body.get("hash"):
+        h = body["hash"].strip().lower()
+        try:
+            results = solr.search(
+                f'content_sha256:"{h}"',
+                fl="filepath,filename,size_bytes,mtime,extension,directory,content_sha256",
+                rows=body.get("limit", 200),
+                sort="filepath asc")
+        except pysolr.SolrError as e:
+            return jsonify({"error": str(e)}), 502
+        return jsonify({"hash": h, "total": results.hits, "docs": list(results)})
+
+    # Mode 2: enumerate duplicate groups via facet
+    min_count = int(body.get("min_count", 2))
+    limit = int(body.get("limit", 100))
+    try:
+        results = solr.search(
+            "content_sha256:[* TO *]",
+            rows=0,
+            **{
+                "facet": "true",
+                "facet.field": "content_sha256",
+                "facet.mincount": min_count,
+                "facet.limit": limit,
+                "facet.sort": "count",
+            })
+    except pysolr.SolrError as e:
+        return jsonify({"error": str(e)}), 502
+
+    facet = results.facets.get("facet_fields", {}).get("content_sha256", [])
+    # Solr returns [h1, count1, h2, count2, ...]
+    groups = [{"hash": facet[i], "count": facet[i + 1]}
+              for i in range(0, len(facet), 2)]
+    return jsonify({"groups": groups, "total_groups": len(groups)})
 
 
 @app.route("/api/content", methods=["POST"])
