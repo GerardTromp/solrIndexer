@@ -47,14 +47,18 @@ sources:
   #     lockfile: /mnt/wd1/sources/pst/.lock
   #     on_failure: skip       # skip | abort | continue-stale
 
-  # ── Pull source example: Gmail via OAuth refresh token (Phase 5) ─────────
+  # ── Pull source: Gmail via OAuth refresh token ───────────────────────────
+  # Implemented in Phase 5. Requires one-time setup: see
+  # /opt/fsearch/sources/gmail/DESIGN.md "Setup checklist".
+  # Reads its own config from env vars (FSEARCH_GMAIL_OUTPUT, optional
+  # FSEARCH_GMAIL_CREDENTIALS, FSEARCH_GMAIL_TOKEN).
   #
   # - name: gmail
   #   kind: imap
-  #   root: /mnt/wd1/sources/gmail
+  #   root: /mnt/wd1/sources/gmail        # = FSEARCH_GMAIL_OUTPUT
   #   hook:
   #     command: /opt/fsearch/sources/gmail/sync.py
-  #     timeout: 900
+  #     timeout: 1800          # first sync may take a while; raise if you have a big mailbox
   #     lockfile: /mnt/wd1/sources/gmail/.lock
   #     on_failure: skip
 

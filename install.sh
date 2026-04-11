@@ -29,7 +29,9 @@ sudo apt install -y openjdk-21-jdk-headless curl python3-pip pst-utils
 java -version
 
 echo "==> Installing Python dependencies..."
-pip install pysolr requests click rich tika pyyaml psutil --break-system-packages
+pip install pysolr requests click rich tika pyyaml psutil \
+    google-api-python-client google-auth-oauthlib \
+    --break-system-packages
 
 # ── 2. Solr ───────────────────────────────────────────────────────────────────
 
