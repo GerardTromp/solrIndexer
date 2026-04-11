@@ -37,6 +37,11 @@ logging.getLogger().addHandler(file_handler)
 
 SOLR_URL     = os.environ.get("SOLR_URL", "http://localhost:8983/solr/filesystem")
 TIKA_URL     = os.environ.get("TIKA_URL", "http://localhost:9998/tika")
+# /rmeta/text returns extracted text AND detected metadata (Content-Type,
+# Content-Language, etc.) in a single call — strictly better than /tika for
+# our use case, zero extra cost. Derived from TIKA_URL by rewriting the path.
+_tika_base = TIKA_URL.rsplit("/", 1)[0] if TIKA_URL.count("/") > 2 else TIKA_URL
+TIKA_RMETA_URL = os.environ.get("TIKA_RMETA_URL", f"{_tika_base}/rmeta/text")
 BATCH_SIZE   = 300
 STATE_FILE   = Path.home() / ".solr" / "indexer_state.json"
 CONTENT_PREVIEW  = 1024               # 1KB stored preview for GUI recognition
@@ -411,10 +416,57 @@ _TIKA_MIME = {
 
 # ── Content extraction ───────────────────────────────────────────────────────
 
-def extract_via_tika(path: Path, large: bool = False) -> str:
-    # Skip if Tika is known-dead or shutdown requested
+def _parse_rmeta_response(payload) -> tuple[str, dict]:
+    """
+    Tika /rmeta/text returns a JSON array — one object per embedded document
+    (compound files like .msg, .zip yield multiple). The first element is
+    the top-level container; its metadata is what we want.
+
+    Returns (content_text, metadata_subset) where metadata_subset contains
+    only the fields we care about in fsearch:
+      - language (normalized lowercase, no region suffix)
+      - mimetype_detected (Content-Type with any charset parameter stripped)
+    """
+    if not isinstance(payload, list) or not payload:
+        return "", {}
+    top = payload[0] if isinstance(payload[0], dict) else {}
+
+    text = top.get("X-TIKA:content", "") or ""
+
+    meta: dict[str, str] = {}
+
+    ct = top.get("Content-Type", "")
+    if isinstance(ct, list):
+        ct = ct[0] if ct else ""
+    if ct:
+        # Strip parameters like '; charset=UTF-8' and normalize lowercase
+        meta["mimetype_detected"] = ct.split(";", 1)[0].strip().lower()
+
+    # Tika reports language under several possible keys depending on version
+    # and file type — check them in order of preference.
+    lang = (top.get("language")
+            or top.get("Content-Language")
+            or top.get("dc:language")
+            or "")
+    if isinstance(lang, list):
+        lang = lang[0] if lang else ""
+    if lang:
+        # "en-US" → "en" — fsearch only cares about language, not region
+        meta["language"] = lang.split("-", 1)[0].strip().lower()
+
+    return text, meta
+
+
+def extract_via_tika(path: Path, large: bool = False) -> tuple[str, dict]:
+    """
+    Extract text + metadata via Tika's /rmeta/text endpoint.
+
+    Returns (content_text, metadata_dict). On any failure the text is empty
+    and the metadata dict is empty; callers must treat both fields as
+    optional. A Tika failure never raises.
+    """
     if not _tika_alive or _shutdown_requested:
-        return ""
+        return "", {}
     timeout = LARGE_TIKA_TIMEOUT if large else 15
     ext = path.suffix.lower()
     content_type = _TIKA_MIME.get(ext, "application/octet-stream")
@@ -422,58 +474,73 @@ def extract_via_tika(path: Path, large: bool = False) -> str:
         with open(path, "rb") as f:
             data = f.read(MAX_CONTENT)
         if _shutdown_requested:
-            return ""
+            return "", {}
         resp = requests.put(
-            TIKA_URL, data=data,
-            headers={"Accept": "text/plain",
+            TIKA_RMETA_URL, data=data,
+            headers={"Accept": "application/json",
                      "Content-Type": content_type},
             timeout=timeout)
         if resp.ok:
             _tika_success()
-            return resp.text
+            try:
+                return _parse_rmeta_response(resp.json())
+            except ValueError as e:
+                # Malformed JSON from Tika — treat as a parse failure but
+                # don't mark Tika dead; the next file may be fine.
+                log.debug(f"Tika rmeta parse error for {path}: {e}")
+                return "", {}
         # Capture Tika's error detail (Java exception) from the response body
         detail = resp.text.strip().split("\n")[0][:200] if resp.text else ""
         reason = f"HTTP {resp.status_code}"
         if detail:
             reason += f" | {detail}"
-        return _tika_failure(path, reason)
+        _tika_failure(path, reason)
+        return "", {}
     except requests.exceptions.Timeout:
         log.warning(f"Tika timeout ({timeout}s) for {path} — skipping content")
-        return _tika_failure(path, "timeout")
+        _tika_failure(path, "timeout")
+        return "", {}
     except requests.exceptions.ConnectionError:
-        return _tika_failure(path, "connection refused")
+        _tika_failure(path, "connection refused")
+        return "", {}
     except Exception as e:
-        return _tika_failure(path, str(e))
+        _tika_failure(path, str(e))
+        return "", {}
 
 
-def extract_content(path: Path, large_files: bool = False) -> str:
+def extract_content(path: Path, large_files: bool = False) -> tuple[str, dict]:
+    """
+    Returns (content_text, metadata_dict). The metadata dict may contain
+    'language' and 'mimetype_detected' for Tika-processed files; it is
+    always empty for plain-text files since we don't run detection on them.
+    """
     if should_skip_content(str(path)):
-        return ""
+        return "", {}
     ext = path.suffix.lower()
     try:
         if ext in TEXT_EXTS:
             sz = path.stat().st_size
             if sz > LARGE_FILE_LIMIT:
                 log.info(f"Skipping content (exceeds hard cap {sz/1024/1024:.0f}MB): {path}")
-                return ""
+                return "", {}
             if sz > MAX_TEXT_SIZE:
                 if not large_files:
                     log.debug(f"Skipping content (>{MAX_TEXT_SIZE//1024//1024}MB, use --large-files): {path}")
-                    return ""
+                    return "", {}
                 log.info(f"Large file content extraction ({sz/1024/1024:.0f}MB): {path}")
             with open(path, "rb") as f:
                 raw = f.read(min(sz, MAX_CONTENT))
-            return raw.decode("utf-8", errors="replace")
+            return raw.decode("utf-8", errors="replace"), {}
         elif ext in TIKA_EXTS:
             sz = path.stat().st_size
             if sz > LARGE_FILE_LIMIT:
-                return ""
+                return "", {}
             if sz > MAX_TEXT_SIZE and not large_files:
-                return ""
+                return "", {}
             return extract_via_tika(path, large=sz > MAX_TEXT_SIZE)
     except Exception as e:
         log.debug(f"Content extraction error {path}: {e}")
-    return ""
+    return "", {}
 
 
 # ── Document builder ─────────────────────────────────────────────────────────
@@ -490,7 +557,7 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
             return None
         ext = path.suffix.lower()
         mime, _ = mimetypes.guess_type(str(path))
-        content = extract_content(path, large_files=large_files)
+        content, extract_meta = extract_content(path, large_files=large_files)
         sha = sha256_file(path, large_files=large_files)
         doc = {
             "id":              str(path),
@@ -507,6 +574,10 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
         }
         if sha:
             doc["content_sha256"] = sha
+        if extract_meta.get("language"):
+            doc["language"] = extract_meta["language"]
+        if extract_meta.get("mimetype_detected"):
+            doc["mimetype_detected"] = extract_meta["mimetype_detected"]
         return doc
     except (PermissionError, FileNotFoundError, OSError) as e:
         log.debug(f"Skipping {path}: {e}")

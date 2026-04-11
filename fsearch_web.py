@@ -18,7 +18,8 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 import pysolr
 
 EXPORT_COLUMNS = ["filepath", "filename", "extension", "size_bytes",
-                  "mtime", "directory", "content_sha256"]
+                  "mtime", "directory", "content_sha256",
+                  "language", "mimetype_detected"]
 EXPORT_MAX_ROWS = 100_000
 
 SOLR_URL = os.environ.get("SOLR_URL", "http://localhost:8983/solr/filesystem")
@@ -186,7 +187,7 @@ def api_search():
     solr = pysolr.Solr(body.get("solr_url", SOLR_URL), timeout=15)
 
     params = {
-        "fl": "filepath,filename,size_bytes,mtime,extension,directory,content_preview,content_sha256",
+        "fl": "filepath,filename,size_bytes,mtime,extension,directory,content_preview,content_sha256,language,mimetype_detected",
         "rows": limit,
         "sort": sort,
     }

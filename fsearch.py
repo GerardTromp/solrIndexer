@@ -104,7 +104,7 @@ def _or_group(clauses: list[str]) -> str:
 def build_query(args) -> tuple[str, dict]:
     clauses = []    # positive (must match)
     negations = []  # negative (must NOT match)
-    params = {"fl": "filepath,filename,size_bytes,mtime,extension,directory,content_sha256",
+    params = {"fl": "filepath,filename,size_bytes,mtime,extension,directory,content_sha256,language,mimetype_detected",
               "rows": args.limit,
               "sort": args.sort}
 
@@ -209,7 +209,8 @@ def fmt_date(s: str) -> str:
 
 
 EXPORT_COLUMNS = ["filepath", "filename", "extension", "size_bytes",
-                  "mtime", "directory", "content_sha256"]
+                  "mtime", "directory", "content_sha256",
+                  "language", "mimetype_detected"]
 
 
 def _resolve_export_format(args) -> str:
