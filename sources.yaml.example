@@ -1,0 +1,85 @@
+# sources.yaml — fsearch source configuration
+#
+# Each entry defines a directory (the "root") that fs_indexer walks and
+# tags with a source name/kind in Solr. Sources may also define a
+# pre-index hook — a shell command run before the walk — used by pull
+# sources like PST extractors or Gmail sync to stage data into the root.
+#
+# Copy this file to /opt/fsearch/sources.yaml (or wherever FSEARCH_SOURCES
+# points) and edit for your environment. fs_indexer picks it up
+# automatically; no CLI flag needed.
+#
+# CLI override:
+#   fs_indexer.py --sources /path/to/sources.yaml
+#   fs_indexer.py --source NAME          # run only one named source
+#   fs_indexer.py --list-sources         # print and exit
+#
+# Back-compat: if this file is absent AND no positional roots are given,
+# fs_indexer falls back to the INDEX_ROOTS env var (legacy behavior).
+
+sources:
+  # ── Plain filesystem root — no hook, just walk ───────────────────────────
+  - name: filesystem
+    kind: fs
+    root: /home/gerard
+    excludes:
+      - node_modules
+      - .git
+      - .venv
+
+  - name: wd1-gt
+    kind: fs
+    root: /mnt/wd1/GT
+
+  # ── Pull source with a pre-index hook (example: PST archive) ─────────────
+  # Uncomment and edit when the PST extractor is wired up (Phase 4).
+  #
+  # - name: pst-archive
+  #   kind: pst
+  #   root: /mnt/wd1/sources/pst
+  #   hook:
+  #     command: /opt/fsearch/sources/pst/extract.py
+  #     timeout: 3600          # seconds — max wall clock for the hook
+  #     lockfile: /mnt/wd1/sources/pst/.lock
+  #     on_failure: skip       # skip | abort | continue-stale
+
+  # ── Pull source example: Gmail via OAuth refresh token (Phase 5) ─────────
+  #
+  # - name: gmail
+  #   kind: imap
+  #   root: /mnt/wd1/sources/gmail
+  #   hook:
+  #     command: /opt/fsearch/sources/gmail/sync.py
+  #     timeout: 900
+  #     lockfile: /mnt/wd1/sources/gmail/.lock
+  #     on_failure: skip
+
+  # ── Push source example: Outlook COM export (Phase 6, separate repo) ─────
+  # No hook — the Windows-side tool writes .msg files into this directory
+  # on its own schedule. fsearch just reads what's there.
+  #
+  # - name: outlook-work
+  #   kind: msg
+  #   root: /mnt/c/OutlookExport
+
+# Notes on hook semantics:
+#
+# on_failure:
+#   skip            → log the failure, skip this source, continue with the
+#                     next (default; safest for nightly cron runs)
+#   abort           → log and exit the whole indexer with nonzero status
+#                     (use for critical pipelines where partial data is
+#                     worse than no data)
+#   continue-stale  → log, then walk the root anyway using whatever data
+#                     was left from the previous successful hook run
+#                     (use for push sources where an occasional sync
+#                     failure shouldn't prevent searching older exports)
+#
+# lockfile:
+#   PID-based. Prevents the same source's hook from overlapping itself
+#   (e.g., if a slow PST extract is still running when the next cron
+#   tick fires). Stale locks (dead PIDs) are taken over automatically.
+#
+# timeout:
+#   Wall-clock budget for the hook command. On exceed, the hook is
+#   killed and the failure path above applies.

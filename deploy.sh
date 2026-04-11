@@ -16,7 +16,9 @@ FSEARCH_DIR="${FSEARCH_DIR:-/opt/fsearch}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WHAT="${1:-all}"
 
-SCRIPTS=(fs_indexer.py fsearch.py fsearch_web.py fsearch_hash.py run_index.sh triage_errors.py)
+SCRIPTS=(fs_indexer.py fsearch.py fsearch_web.py fsearch_hash.py fs_sources.py run_index.sh triage_errors.py)
+# Non-script assets copied only when missing (never overwritten)
+PRESERVE_IF_EXISTS=(sources.yaml.example)
 
 if [[ ! -d "$FSEARCH_DIR" ]]; then
     echo "ERROR: $FSEARCH_DIR does not exist. Run install.sh first." >&2
@@ -29,6 +31,14 @@ deploy_scripts() {
         if [[ -f "$SCRIPT_DIR/$f" ]]; then
             sudo cp "$SCRIPT_DIR/$f" "$FSEARCH_DIR/$f"
             echo "    $f"
+        fi
+    done
+    # Non-script assets: copy only if not already present (never clobber a
+    # live config with the example).
+    for f in "${PRESERVE_IF_EXISTS[@]}"; do
+        if [[ -f "$SCRIPT_DIR/$f" && ! -f "$FSEARCH_DIR/$f" ]]; then
+            sudo cp "$SCRIPT_DIR/$f" "$FSEARCH_DIR/$f"
+            echo "    $f (new)"
         fi
     done
     sudo chmod +x "$FSEARCH_DIR"/*.py "$FSEARCH_DIR"/*.sh 2>/dev/null || true

@@ -29,7 +29,7 @@ sudo apt install -y openjdk-21-jdk-headless curl python3-pip
 java -version
 
 echo "==> Installing Python dependencies..."
-pip install pysolr requests click rich tika --break-system-packages
+pip install pysolr requests click rich tika pyyaml psutil --break-system-packages
 
 # ── 2. Solr ───────────────────────────────────────────────────────────────────
 
@@ -77,7 +77,11 @@ EOF
 echo "==> Installing fsearch scripts to ${FSEARCH_DIR}..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 sudo mkdir -p "$FSEARCH_DIR"
-sudo cp "$SCRIPT_DIR/fs_indexer.py" "$SCRIPT_DIR/fsearch.py" "$SCRIPT_DIR/fsearch_web.py" "$SCRIPT_DIR/fsearch_hash.py" "$SCRIPT_DIR/run_index.sh" "$FSEARCH_DIR/"
+sudo cp "$SCRIPT_DIR/fs_indexer.py" "$SCRIPT_DIR/fsearch.py" "$SCRIPT_DIR/fsearch_web.py" "$SCRIPT_DIR/fsearch_hash.py" "$SCRIPT_DIR/fs_sources.py" "$SCRIPT_DIR/run_index.sh" "$FSEARCH_DIR/"
+# Drop the example config if a live one doesn't already exist
+if [[ ! -f "$FSEARCH_DIR/sources.yaml" ]]; then
+    sudo cp "$SCRIPT_DIR/sources.yaml.example" "$FSEARCH_DIR/sources.yaml.example"
+fi
 sudo mkdir -p "$FSEARCH_DIR/static"
 sudo cp "$SCRIPT_DIR/static/search.html" "$FSEARCH_DIR/static/"
 sudo chmod +x "$FSEARCH_DIR/run_index.sh" "$FSEARCH_DIR/fsearch.py" "$FSEARCH_DIR/fs_indexer.py" "$FSEARCH_DIR/fsearch_web.py"

@@ -17,6 +17,7 @@ import pysolr
 import requests
 
 from fsearch_hash import sha256_file
+from fs_sources import Source, load_sources, run_hook, DEFAULT_SOURCES_FILE
 from rich.progress import Progress, SpinnerColumn, TextColumn, MofNCompleteColumn
 from rich.logging import RichHandler
 from rich.console import Console
@@ -59,6 +60,14 @@ LOCK_FILE = Path(os.environ.get("FSEARCH_LOCK", "/mnt/wd1/solr/indexer.lock"))
 
 # Graceful shutdown flag — checked between files in the index loop
 _shutdown_requested = False
+
+# Source tagging — set by _worker() at the start of each per-source indexing
+# run; read by file_to_doc() when building the Solr doc. Uses module globals
+# rather than signature threading because file_to_doc lives behind a thread
+# pool and a multiprocessing boundary, and each source gets its own child
+# process (so there's no shared-state concern).
+_CURRENT_SOURCE_NAME: str | None = None
+_CURRENT_SOURCE_KIND: str | None = None
 
 def _handle_signal(signum, frame):
     """Signal handler for the worker (child) process."""
@@ -179,7 +188,17 @@ def group_roots_by_device(roots: list[Path]) -> dict[int, list[Path]]:
 
 
 def _device_cache_path(dev_id: int) -> Path:
-    """Per-device find cache path."""
+    """
+    Per-device find cache path, further qualified by the current source
+    name when running under the multi-source loop. Without a source
+    suffix, two sources on the same filesystem would share a cache file
+    and clobber each other — source B would reuse source A's file list.
+    """
+    src = _CURRENT_SOURCE_NAME
+    if src:
+        # sanitize for filesystem: keep alnum + a few safe chars
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in src)
+        return FIND_CACHE.parent / f"{FIND_CACHE.stem}_src-{safe}_dev{dev_id}{FIND_CACHE.suffix}"
     return FIND_CACHE.parent / f"{FIND_CACHE.stem}_dev{dev_id}{FIND_CACHE.suffix}"
 
 
@@ -578,6 +597,10 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
             doc["language"] = extract_meta["language"]
         if extract_meta.get("mimetype_detected"):
             doc["mimetype_detected"] = extract_meta["mimetype_detected"]
+        if _CURRENT_SOURCE_NAME:
+            doc["source_name"] = _CURRENT_SOURCE_NAME
+        if _CURRENT_SOURCE_KIND:
+            doc["source_kind"] = _CURRENT_SOURCE_KIND
         return doc
     except (PermissionError, FileNotFoundError, OSError) as e:
         log.debug(f"Skipping {path}: {e}")
@@ -851,14 +874,49 @@ def _build_existing_set(roots: list[Path], exclude: set[Path]) -> set[str]:
     return existing
 
 
+def _purge_scope_query(roots: list[Path] | None) -> str:
+    """
+    Build a Solr query that restricts the purge cursor scan to docs
+    belonging to the current run — either by source_name (preferred,
+    set when running under the multi-source loop) or by path-prefix
+    match on the given roots (legacy/CLI-roots path).
+    """
+    if _CURRENT_SOURCE_NAME:
+        # Escape double-quotes in source names just in case
+        esc = _CURRENT_SOURCE_NAME.replace('"', '\\"')
+        return f'source_name:"{esc}"'
+
+    if roots:
+        # Solr string-field prefix query via wildcard. Escape chars that
+        # are special in Solr queries: space, colon, double-quote, slash,
+        # plus, minus, parens, brackets, braces, caret, tilde, star,
+        # question mark, backslash, ampersand, pipe, exclamation.
+        specials = r' +:-^~*?"/\\&|!()[]{}'
+        def esc(p: str) -> str:
+            return "".join(("\\" + c) if c in specials else c for c in p)
+        clauses = [f"filepath:{esc(str(r).rstrip('/'))}\\/*" for r in roots]
+        # Also match docs whose id equals the root itself (rare but valid).
+        id_clauses = [f"id:{esc(str(r).rstrip('/'))}" for r in roots]
+        return "(" + " OR ".join(clauses + id_clauses) + ")"
+
+    return "*:*"   # no scoping info — legacy fallback, walks entire index
+
+
 def purge_deleted(solr: pysolr.Solr, roots: list[Path] = None,
                   exclude: set[Path] = None, batch_size: int = 50000):
     """
     Delete Solr docs for files that no longer exist on disk.
 
-    If roots/exclude are provided, builds a fast filesystem snapshot first
-    and uses set membership for O(1) lookups (instead of one stat per doc).
-    Falls back to per-file Path.exists() if roots are not available.
+    The cursor scan is scoped to the current source (via source_name)
+    or, failing that, to docs whose filepath falls under one of the
+    given roots. This prevents a per-source purge from deleting docs
+    owned by OTHER sources just because they aren't under this source's
+    root directory.
+
+    If roots/exclude are provided, builds a fast filesystem snapshot
+    first and uses set membership for O(1) lookups (instead of one stat
+    per doc). Falls back to per-file Path.exists() if roots are not
+    available.
     """
     # Build snapshot if we have roots
     if roots and not _shutdown_requested:
@@ -868,8 +926,11 @@ def purge_deleted(solr: pysolr.Solr, roots: list[Path] = None,
         existing = None
         use_snapshot = False
 
-    log.info("Running delete pass%s...",
-             f" ({len(existing):,} files in snapshot)" if use_snapshot else "")
+    scope_q = _purge_scope_query(roots)
+
+    log.info("Running delete pass%s (scope: %s)...",
+             f" ({len(existing):,} files in snapshot)" if use_snapshot else "",
+             scope_q[:80] + ("..." if len(scope_q) > 80 else ""))
     cursor = "*"
     deleted = 0
 
@@ -877,7 +938,7 @@ def purge_deleted(solr: pysolr.Solr, roots: list[Path] = None,
         if _shutdown_requested:
             log.info(f"Shutdown — aborting delete pass (purged {deleted} so far)")
             break
-        results = solr.search("*:*",
+        results = solr.search(scope_q,
                               fl="id",
                               rows=batch_size,
                               sort="id asc",
@@ -1127,14 +1188,23 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
         save_state(state)
         incremental = False
 
+    # Per-source state lives under state["sources"][name]; global
+    # state["last_run"] is preserved for legacy single-root back-compat.
+    src_key = _CURRENT_SOURCE_NAME
+    if src_key:
+        per_src = state.setdefault("sources", {}).setdefault(src_key, {})
+        last = per_src.get("last_run")
+    else:
+        last = state.get("last_run")
+
     since_ts = None
     if incremental:
-        last = state.get("last_run")
         if last:
             since_ts = datetime.datetime.fromisoformat(last).timestamp()
-            log.info(f"Incremental mode: indexing files newer than {last}")
+            label = f"source '{src_key}'" if src_key else "legacy"
+            log.info(f"Incremental mode ({label}): indexing files newer than {last}")
         else:
-            log.info("No previous run found — falling back to full index")
+            log.info("No previous run found for this source — falling back to full index")
 
     exclude = {Path(e).resolve() for e in exclude_paths}
     roots_p = [Path(r) for r in roots]
@@ -1157,8 +1227,14 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
     # ── Find phase (parallel per device) ──────────────────────────────────────
     # Map each device to its cache path
     if n_devices == 1:
-        # Single device — use the default cache path for backward compat
-        dev_caches = {next(iter(dev_groups)): FIND_CACHE}
+        # Single device — use the default cache path if no source is
+        # active (legacy back-compat), otherwise per-source to avoid
+        # collisions between two sources on the same filesystem.
+        only_dev = next(iter(dev_groups))
+        if _CURRENT_SOURCE_NAME:
+            dev_caches = {only_dev: _device_cache_path(only_dev)}
+        else:
+            dev_caches = {only_dev: FIND_CACHE}
     else:
         dev_caches = {dev_id: _device_cache_path(dev_id) for dev_id in dev_groups}
 
@@ -1193,7 +1269,11 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
     # ── Save state at start so interruptions leave a checkpoint ───────────────
     run_start = datetime.datetime.utcnow()
     if not dry_run:
-        state["last_run"] = run_start.isoformat()
+        ts_iso = run_start.isoformat()
+        if src_key:
+            state.setdefault("sources", {}).setdefault(src_key, {})["last_run"] = ts_iso
+        else:
+            state["last_run"] = ts_iso
         save_state(state)
 
     # ── Fetch existing metadata for change detection ────────────────────────────
@@ -1294,11 +1374,19 @@ def run_index(roots, exclude_paths, incremental: bool, no_purge: bool,
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _worker(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
-            solr_url, large_files, retry_errors):
+            solr_url, large_files, retry_errors,
+            source_name=None, source_kind=None):
     """
     Worker function — runs in a child process.
     Installs signal handlers and does all the actual indexing work.
+    Source tagging is done via module globals set here; they are inherited
+    by any threads the worker spawns (ThreadPoolExecutor for multi-device
+    indexing) and read by file_to_doc() when building each Solr doc.
     """
+    global _CURRENT_SOURCE_NAME, _CURRENT_SOURCE_KIND
+    _CURRENT_SOURCE_NAME = source_name
+    _CURRENT_SOURCE_KIND = source_kind
+
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
@@ -1334,16 +1422,21 @@ def _worker(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
 
 
 def _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
-                  solr_url, large_files, retry_errors):
+                  solr_url, large_files, retry_errors,
+                  source_name=None, source_kind=None):
     """
     Fork a child process to do the work. The parent supervises and handles
     SIGTERM by killing the child — this works even when the child is blocked
     in a C-level call (HTTP request, subprocess, etc.).
+
+    Returns the child exit code (0 on success). Prior versions called
+    sys.exit here; the new multi-source loop in main() needs to invoke
+    _run_in_child once per source and inspect each exit code.
     """
     child = multiprocessing.Process(
         target=_worker,
         args=(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
-              solr_url, large_files, retry_errors),
+              solr_url, large_files, retry_errors, source_name, source_kind),
         daemon=False,
     )
     child.start()
@@ -1373,7 +1466,8 @@ def _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
     # Wait for child to finish
     child.join()
 
-    # Clean up lock if child exited without releasing (crash, kill, etc.)
+    # Clean up lock if child exited without releasing (crash, kill, etc.).
+    # The parent may re-acquire for the next source in the multi-source loop.
     if LOCK_FILE.exists():
         try:
             lock_pid = int(LOCK_FILE.read_text().strip())
@@ -1382,7 +1476,57 @@ def _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
         except (ValueError, OSError):
             pass
 
-    sys.exit(child.exitcode or 0)
+    return child.exitcode or 0
+
+
+def _resolve_sources(roots, exclude, sources_file, source_filter):
+    """
+    Build the list of Source objects to process for this run.
+
+    Precedence (back-compat + config coexistence):
+      1. Positional `roots` on CLI → wrap each as a legacy-fs source.
+         Overrides any config file. This is the pre-Phase-2 behavior.
+      2. sources.yaml config file → parse it. --source NAME filters to
+         a single entry.
+      3. Fallback: INDEX_ROOTS env var split on whitespace → legacy-fs.
+    """
+    if roots:
+        # Pre-Phase-2 behaviour: multiple positional roots were ONE indexer
+        # run across multiple devices. Preserve that by bundling them into
+        # a single "legacy-fs" source with multi-root.
+        return [Source(
+            name="legacy-fs", kind="fs",
+            roots=[Path(r) for r in roots],
+            excludes=list(exclude),
+        )]
+
+    path = Path(sources_file) if sources_file else DEFAULT_SOURCES_FILE
+    try:
+        src_list = load_sources(path)
+    except (ValueError, RuntimeError) as e:
+        log.error(f"Failed to load {path}: {e}")
+        sys.exit(2)
+
+    if not src_list:
+        env_roots = os.environ.get("INDEX_ROOTS", "").split()
+        if env_roots:
+            log.info(f"No sources.yaml at {path} — falling back to INDEX_ROOTS env")
+            src_list = [Source(
+                name="legacy-fs", kind="fs",
+                roots=[Path(r) for r in env_roots],
+                excludes=list(exclude),
+            )]
+
+    if source_filter:
+        matched = [s for s in src_list if s.name == source_filter]
+        if not matched:
+            available = ", ".join(s.name for s in src_list) or "(none)"
+            log.error(
+                f"--source '{source_filter}' not found. Available: {available}")
+            sys.exit(1)
+        src_list = matched
+
+    return src_list
 
 
 @click.command()
@@ -1403,7 +1547,15 @@ def _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
               help="Stop a running indexer gracefully (sends SIGTERM)")
 @click.option("--status", is_flag=True, default=False,
               help="Check if an indexer is currently running")
-def main(roots, exclude, full, rebuild, no_purge, purge_only, dry_run, solr_url, large_files, retry_errors, stop, status):
+@click.option("--sources", "sources_file", default=None, metavar="PATH",
+              help=f"Path to sources.yaml [{DEFAULT_SOURCES_FILE}]")
+@click.option("--source", "source_filter", default=None, metavar="NAME",
+              help="Run only the named source from sources.yaml")
+@click.option("--list-sources", is_flag=True, default=False,
+              help="Parse sources.yaml and print the resolved source list")
+def main(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
+         solr_url, large_files, retry_errors, stop, status,
+         sources_file, source_filter, list_sources):
     """Crawl ROOT paths and index (or incrementally update) Solr."""
     if stop:
         stop_running_indexer()
@@ -1421,11 +1573,93 @@ def main(roots, exclude, full, rebuild, no_purge, purge_only, dry_run, solr_url,
             log.info("No indexer running")
         return
 
+    sources_list = _resolve_sources(roots, exclude, sources_file, source_filter)
+
+    if list_sources:
+        if not sources_list:
+            log.info("No sources configured")
+            return
+        print(f"{'NAME':20s} {'KIND':10s} {'HOOK':5s} ROOTS")
+        for s in sources_list:
+            has_hook = "yes" if s.hook else "no"
+            roots_label = ", ".join(str(r) for r in s.roots)
+            print(f"{s.name:20s} {s.kind:10s} {has_hook:5s} {roots_label}")
+        return
+
+    # --retry-errors doesn't need a source (it consumes the error log).
+    # --purge-only and normal runs do.
+    if not sources_list and not retry_errors:
+        log.error("Nothing to index — no sources configured, no CLI roots, "
+                  "and no INDEX_ROOTS env var set")
+        sys.exit(1)
+
     if not acquire_lock():
         sys.exit(1)
 
-    _run_in_child(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
-                  solr_url, large_files, retry_errors)
+    worst_exit = 0
+
+    # Special path: --retry-errors without any sources → run once, legacy-style.
+    if retry_errors and not sources_list:
+        worst_exit = _run_in_child(
+            (), tuple(exclude), full, rebuild, no_purge, purge_only, dry_run,
+            solr_url, large_files, retry_errors)
+        sys.exit(worst_exit)
+
+    for src in sources_list:
+        roots_label = ", ".join(str(r) for r in src.roots)
+        log.info(f"=== Source: [cyan]{src.name}[/cyan] "
+                 f"([magenta]{src.kind}[/magenta]) → {roots_label} ===")
+
+        # Re-assert parent-held lock before each child takes over; prevents
+        # a racing cron tick from sneaking in between sources.
+        try:
+            LOCK_FILE.write_text(str(os.getpid()))
+        except OSError as e:
+            log.error(f"Lock re-assert failed: {e}")
+            worst_exit = max(worst_exit, 1)
+            break
+
+        # Run pre-index hook if configured
+        if src.hook:
+            hook_ok = run_hook(src, log)
+            if not hook_ok:
+                mode = src.hook.on_failure
+                if mode == "abort":
+                    log.error(f"Hook failed for '{src.name}' with on_failure=abort — stopping")
+                    worst_exit = 2
+                    break
+                if mode == "skip":
+                    log.warning(f"Hook failed for '{src.name}' — skipping source")
+                    worst_exit = max(worst_exit, 1)
+                    continue
+                # continue-stale: fall through, walk the root anyway
+                log.warning(f"Hook failed for '{src.name}' — continuing with stale data")
+
+        # Merge per-source excludes with CLI-level excludes
+        combined_excludes = tuple(list(exclude) + list(src.excludes))
+
+        ec = _run_in_child(
+            tuple(str(r) for r in src.roots), combined_excludes,
+            full, rebuild, no_purge, purge_only, dry_run,
+            solr_url, large_files, retry_errors,
+            source_name=src.name, source_kind=src.kind)
+        worst_exit = max(worst_exit, ec)
+
+        if _shutdown_requested:
+            log.info("Shutdown requested — not starting further sources")
+            break
+
+    # Final lock cleanup — _run_in_child may have released it already, but
+    # if we broke out early on a hook failure the parent pid is still there.
+    if LOCK_FILE.exists():
+        try:
+            pid = int(LOCK_FILE.read_text().strip())
+            if pid == os.getpid():
+                LOCK_FILE.unlink()
+        except (ValueError, OSError):
+            pass
+
+    sys.exit(worst_exit)
 
 
 if __name__ == "__main__":
