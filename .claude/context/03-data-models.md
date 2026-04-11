@@ -14,10 +14,17 @@
 | `directory` | string | yes | yes | Parent directory path |
 | `size_bytes` | plong | yes | yes | File size in bytes |
 | `mtime` | pdate | yes | yes | Last modified time |
-| `mimetype` | string | yes | yes | MIME type from Tika |
-| `content` | text_general | yes | yes | Full extracted text |
+| `mimetype` | string | yes | yes | MIME type (filename-guessed) |
+| `mimetype_detected` | string | yes | yes | MIME type from Tika `/rmeta/text` |
+| `language` | string | yes | yes | ISO-639 language from Tika detection |
+| `content` | text_general | no | yes | Full extracted text |
 | `content_preview` | string | yes | no | First 1KB of content |
+| `content_sha256` | string | yes | yes | SHA-256 of file bytes (for dedup) |
 | `owner` | string | yes | yes | Unix UID |
+| `source_name` | string | yes | yes | e.g. `filesystem`, `pst-archive`, `gmail` |
+| `source_kind` | string | yes | yes | e.g. `fs`, `pst`, `imap`, `msg` |
+| `source_timestamp` | pdate | yes | yes | Source-native time (email sent date, etc.) |
+| `source_metadata` | string | yes | no | Opaque JSON blob, source-specific |
 | `_text_` | text_general | no | yes | Catch-all copy field |
 
 ### Copy Fields
