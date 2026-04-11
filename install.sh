@@ -25,7 +25,7 @@ SOLR_LOGS="$DATA_MOUNT/solr/logs"
 
 echo "==> Installing Java 21..."
 sudo apt update -q
-sudo apt install -y openjdk-21-jdk-headless curl python3-pip
+sudo apt install -y openjdk-21-jdk-headless curl python3-pip pst-utils
 java -version
 
 echo "==> Installing Python dependencies..."
@@ -81,6 +81,12 @@ sudo cp "$SCRIPT_DIR/fs_indexer.py" "$SCRIPT_DIR/fsearch.py" "$SCRIPT_DIR/fsearc
 # Drop the example config if a live one doesn't already exist
 if [[ ! -f "$FSEARCH_DIR/sources.yaml" ]]; then
     sudo cp "$SCRIPT_DIR/sources.yaml.example" "$FSEARCH_DIR/sources.yaml.example"
+fi
+# Per-source helper scripts (PST extractor, future Gmail, etc.)
+sudo mkdir -p "$FSEARCH_DIR/sources"
+if [[ -d "$SCRIPT_DIR/sources" ]]; then
+    sudo cp -r "$SCRIPT_DIR/sources/." "$FSEARCH_DIR/sources/"
+    sudo find "$FSEARCH_DIR/sources" -name "*.py" -exec chmod +x {} \;
 fi
 sudo mkdir -p "$FSEARCH_DIR/static"
 sudo cp "$SCRIPT_DIR/static/search.html" "$FSEARCH_DIR/static/"

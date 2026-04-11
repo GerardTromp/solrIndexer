@@ -51,11 +51,26 @@ deploy_static() {
     ls "$FSEARCH_DIR/static/" | sed 's/^/    /'
 }
 
+deploy_sources() {
+    if [[ ! -d "$SCRIPT_DIR/sources" ]]; then
+        return
+    fi
+    echo "==> Deploying sources/ to ${FSEARCH_DIR}/sources/"
+    sudo mkdir -p "$FSEARCH_DIR/sources"
+    sudo cp -r "$SCRIPT_DIR/sources/." "$FSEARCH_DIR/sources/"
+    # Strip Python build artifacts that may have been created locally.
+    sudo find "$FSEARCH_DIR/sources" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    sudo find "$FSEARCH_DIR/sources" -name "*.pyc" -delete 2>/dev/null || true
+    sudo find "$FSEARCH_DIR/sources" -name "*.py" -exec chmod +x {} \;
+    find "$FSEARCH_DIR/sources" -mindepth 1 -maxdepth 2 | sed 's/^/    /'
+}
+
 case "$WHAT" in
-    all)     deploy_scripts; deploy_static ;;
+    all)     deploy_scripts; deploy_static; deploy_sources ;;
     scripts) deploy_scripts ;;
     static)  deploy_static ;;
-    *)       echo "Usage: $0 [all|scripts|static]" >&2; exit 2 ;;
+    sources) deploy_sources ;;
+    *)       echo "Usage: $0 [all|scripts|static|sources]" >&2; exit 2 ;;
 esac
 
 echo "==> Done."

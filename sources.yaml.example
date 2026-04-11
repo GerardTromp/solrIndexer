@@ -31,12 +31,16 @@ sources:
     kind: fs
     root: /mnt/wd1/GT
 
-  # ── Pull source with a pre-index hook (example: PST archive) ─────────────
-  # Uncomment and edit when the PST extractor is wired up (Phase 4).
+  # ── Pull source with a pre-index hook: PST archive ───────────────────────
+  # Implemented in Phase 4. The hook script reads its own config from
+  # environment variables (FSEARCH_PST_INPUT_DIR, FSEARCH_PST_OUTPUT) so
+  # the indexer doesn't need to know anything about PST extraction.
+  # Set those env vars in /etc/cron.d/fsearch or run_index.sh, then
+  # uncomment this block.
   #
   # - name: pst-archive
   #   kind: pst
-  #   root: /mnt/wd1/sources/pst
+  #   root: /mnt/wd1/sources/pst        # = FSEARCH_PST_OUTPUT
   #   hook:
   #     command: /opt/fsearch/sources/pst/extract.py
   #     timeout: 3600          # seconds — max wall clock for the hook
