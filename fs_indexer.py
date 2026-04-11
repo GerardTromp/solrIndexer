@@ -17,7 +17,10 @@ import pysolr
 import requests
 
 from fsearch_hash import sha256_file
-from fs_sources import Source, load_sources, run_hook, DEFAULT_SOURCES_FILE
+from fs_sources import (
+    Source, load_sources, run_hook, DEFAULT_SOURCES_FILE,
+    Manifest, load_manifest,
+)
 from rich.progress import Progress, SpinnerColumn, TextColumn, MofNCompleteColumn
 from rich.logging import RichHandler
 from rich.console import Console
@@ -68,6 +71,7 @@ _shutdown_requested = False
 # process (so there's no shared-state concern).
 _CURRENT_SOURCE_NAME: str | None = None
 _CURRENT_SOURCE_KIND: str | None = None
+_CURRENT_MANIFEST: Manifest | None = None
 
 def _handle_signal(signum, frame):
     """Signal handler for the worker (child) process."""
@@ -571,6 +575,10 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
     try:
         if path.name.startswith("~$"):   # Office lock/temp files — always garbage
             return None
+        if path.name == ".manifest.json":
+            # Sidecar metadata file consumed by the manifest reader —
+            # never indexed as a searchable doc itself.
+            return None
         s = path.stat()
         if stat.S_ISLNK(s.st_mode):   # skip symlinks to avoid loops
             return None
@@ -601,6 +609,26 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
             doc["source_name"] = _CURRENT_SOURCE_NAME
         if _CURRENT_SOURCE_KIND:
             doc["source_kind"] = _CURRENT_SOURCE_KIND
+
+        # Manifest enrichment: if this source carries a .manifest.json,
+        # look up the file's relative path and apply any source-native
+        # timestamp or opaque metadata blob the source recorded for it.
+        # Missing entries are fine (not every file needs one).
+        if _CURRENT_MANIFEST:
+            entry = _CURRENT_MANIFEST.lookup(path)
+            if entry:
+                ts = entry.get("source_timestamp")
+                if ts:
+                    doc["source_timestamp"] = ts
+                md = entry.get("metadata")
+                if md is not None:
+                    # Stored as an opaque string — fsearch doesn't index
+                    # the inner structure, it just retrieves it for display.
+                    try:
+                        doc["source_metadata"] = json.dumps(md, default=str)
+                    except (TypeError, ValueError) as e:
+                        log.debug(f"Manifest metadata not JSON-serializable for {path}: {e}")
+
         return doc
     except (PermissionError, FileNotFoundError, OSError) as e:
         log.debug(f"Skipping {path}: {e}")
@@ -1383,9 +1411,23 @@ def _worker(roots, exclude, full, rebuild, no_purge, purge_only, dry_run,
     by any threads the worker spawns (ThreadPoolExecutor for multi-device
     indexing) and read by file_to_doc() when building each Solr doc.
     """
-    global _CURRENT_SOURCE_NAME, _CURRENT_SOURCE_KIND
+    global _CURRENT_SOURCE_NAME, _CURRENT_SOURCE_KIND, _CURRENT_MANIFEST
     _CURRENT_SOURCE_NAME = source_name
     _CURRENT_SOURCE_KIND = source_kind
+
+    # Optional manifest enrichment. If a source root contains a
+    # .manifest.json, load it once here and let file_to_doc() look up
+    # entries per file. Plain filesystem sources almost never have one,
+    # so the missing-file case (load_manifest returns None) is normal.
+    # For single-root sources we use roots[0]; for legacy multi-root
+    # bundles we try each root in order and keep the first manifest found.
+    _CURRENT_MANIFEST = None
+    if source_name:
+        for r in roots:
+            mf = load_manifest(Path(r), log=log)
+            if mf is not None:
+                _CURRENT_MANIFEST = mf
+                break
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

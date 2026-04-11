@@ -16,6 +16,7 @@ machinery for each.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -231,3 +232,107 @@ def run_hook(source: Source, log) -> bool:
     finally:
         if hook.lockfile:
             release_source_lock(hook.lockfile)
+
+
+# ── Manifest reader ──────────────────────────────────────────────────────────
+
+MANIFEST_FILENAME = ".manifest.json"
+
+
+class Manifest:
+    """
+    In-memory view of a source's sibling `.manifest.json`.
+
+    Expected format (version 1):
+
+        {
+          "version": 1,
+          "source_name": "gmail",
+          "generated_at": "2026-04-11T08:30:00Z",
+          "entries": {
+            "inbox/2024/2024-03-15_subject-abc.eml": {
+              "source_timestamp": "2024-03-15T09:14:22Z",
+              "metadata": {
+                "from": "alice@example.com",
+                "to": ["bob@example.com"],
+                "subject": "Subject ABC",
+                "message_id": "<xyz@mail>"
+              }
+            },
+            ...
+          }
+        }
+
+    Entry keys are paths **relative to the source root** — this keeps the
+    manifest valid across remounts (e.g., /mnt/wd1 -> /mnt/data).
+
+    The loader is lenient: missing files, malformed JSON, and unknown
+    version numbers all degrade gracefully to "no manifest data", so a
+    broken manifest never prevents indexing.
+    """
+
+    def __init__(self, source_root: Path, entries: dict[str, dict]):
+        self.source_root = source_root
+        self._entries = entries
+
+    def lookup(self, path: Path) -> dict | None:
+        """
+        Return the manifest entry for `path`, or None if not listed.
+        Path is matched by its position relative to the source root.
+        """
+        try:
+            rel = path.resolve().relative_to(self.source_root.resolve())
+        except (ValueError, OSError):
+            return None
+        # Manifest keys are posix-style by convention; match both the
+        # as_posix form and the raw string form for author convenience.
+        rel_str = rel.as_posix()
+        return self._entries.get(rel_str) or self._entries.get(str(rel))
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
+
+def load_manifest(source_root: Path, log=None) -> Manifest | None:
+    """
+    Read `<source_root>/.manifest.json` if present. Returns None if
+    there's no manifest (the common case for plain fs sources), a
+    populated Manifest on success, or an empty Manifest on load/parse
+    errors so the caller can distinguish "intentionally absent" (None)
+    from "tried to load but couldn't" (empty).
+    """
+    mf_path = source_root / MANIFEST_FILENAME
+    if not mf_path.exists():
+        return None
+
+    try:
+        with mf_path.open() as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        if log is not None:
+            log.warning(f"Manifest load failed at {mf_path}: {e}")
+        return Manifest(source_root, {})
+
+    if not isinstance(data, dict):
+        if log is not None:
+            log.warning(f"Manifest at {mf_path} is not a JSON object")
+        return Manifest(source_root, {})
+
+    version = data.get("version", 1)
+    if version != 1:
+        if log is not None:
+            log.warning(f"Manifest {mf_path} uses unsupported version {version}")
+        return Manifest(source_root, {})
+
+    entries = data.get("entries", {})
+    if not isinstance(entries, dict):
+        if log is not None:
+            log.warning(f"Manifest at {mf_path}: 'entries' must be a mapping")
+        return Manifest(source_root, {})
+
+    if log is not None:
+        log.info(f"Loaded manifest from {mf_path} ({len(entries)} entries)")
+    return Manifest(source_root, entries)
