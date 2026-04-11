@@ -284,6 +284,13 @@ kbd {
     <button class="btn btn-secondary" onclick="addRow()">+ Add row</button>
     <button class="btn btn-secondary" onclick="sortRowsNotLast()" title="Move NOT rows to end">NOT&rarr;end</button>
     <button class="btn btn-secondary" onclick="clearAll()">Clear</button>
+    <button class="btn btn-secondary" onclick="doExport('csv')"
+            title="Download filtered list as CSV (all columns)">Export CSV</button>
+    <button class="btn btn-secondary" onclick="doExport('txt')"
+            title="Download filtered list as TXT (filepath only)">Export TXT</button>
+    <label title="Max rows to export (capped server-side at 100000)">Export max
+      <input type="number" id="export-limit" value="10000" min="1" max="100000" style="width:80px">
+    </label>
 
     <label>Limit
       <input type="number" id="limit" value="50" min="1" max="500" style="width:60px">
@@ -665,6 +672,60 @@ function flashStatus(msg) {
   const prev = status.innerHTML;
   status.innerHTML = `<span style="color:var(--green)">${msg}</span>`;
   setTimeout(() => { status.innerHTML = prev; }, 1500);
+}
+
+// ── Export ──────────────────────────────────────────────────────────────────
+
+async function doExport(format) {
+  const rows = getRows();
+  if (rows.length === 0) {
+    flashStatus("Nothing to export — add at least one filter");
+    return;
+  }
+
+  const status = document.getElementById("status");
+  status.innerHTML = `Exporting <strong>${format.toUpperCase()}</strong>...`;
+
+  const payload = {
+    rows,
+    format,
+    limit: parseInt(document.getElementById("export-limit").value) || 10000,
+    sort:  document.getElementById("sort").value,
+  };
+
+  try {
+    const resp = await fetch("/api/export", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try { const j = await resp.json(); if (j.error) msg = j.error; } catch {}
+      status.innerHTML = `<span class="error">Export failed: ${escHtml(msg)}</span>`;
+      return;
+    }
+
+    // Parse filename from Content-Disposition
+    const cd = resp.headers.get("Content-Disposition") || "";
+    const m = cd.match(/filename="([^"]+)"/);
+    const filename = m ? m[1] : `fsearch_export.${format}`;
+
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    flashStatus(`Downloaded ${filename} (${fmtSize(blob.size)})`);
+  } catch (e) {
+    status.innerHTML = `<span class="error">Export failed: ${escHtml(e.message)}</span>`;
+  }
 }
 
 // ── Keyboard shortcuts ──────────────────────────────────────────────────────

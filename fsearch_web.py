@@ -11,11 +11,15 @@ Provides:
     POST /api/content   — fetch first paragraph of a file's indexed content
 """
 
-import os, re, datetime, json, argparse
+import os, re, csv, io, datetime, json, argparse
 from pathlib import Path
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response
 import pysolr
+
+EXPORT_COLUMNS = ["filepath", "filename", "extension", "size_bytes",
+                  "mtime", "directory"]
+EXPORT_MAX_ROWS = 100_000
 
 SOLR_URL = os.environ.get("SOLR_URL", "http://localhost:8983/solr/filesystem")
 HERE = Path(__file__).resolve().parent
@@ -214,6 +218,71 @@ def api_search():
         "total": results.hits,
         "docs": docs,
     })
+
+
+@app.route("/api/export", methods=["POST"])
+def api_export():
+    """
+    Export filtered file listing as csv, txt, or json.
+
+    Body: {rows, format, limit, sort, solr_url}
+      - format: "csv" | "txt" | "json"
+      - limit:  max docs to export (capped at EXPORT_MAX_ROWS)
+    """
+    body = request.get_json(force=True)
+    rows = body.get("rows", [])
+    fmt = (body.get("format") or "csv").lower()
+    if fmt not in ("csv", "txt", "json"):
+        return jsonify({"error": f"invalid format: {fmt}"}), 400
+
+    limit = min(int(body.get("limit", 10_000)), EXPORT_MAX_ROWS)
+    sort = body.get("sort", "score desc")
+
+    try:
+        q = build_query_from_rows(rows)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    solr = pysolr.Solr(body.get("solr_url", SOLR_URL), timeout=60)
+
+    try:
+        results = solr.search(q, fl=",".join(EXPORT_COLUMNS),
+                              rows=limit, sort=sort)
+    except pysolr.SolrError as e:
+        return jsonify({"error": f"Solr error: {e}"}), 502
+
+    docs = list(results)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if fmt == "txt":
+        body_text = "\n".join(d.get("filepath", "") for d in docs) + "\n"
+        return Response(
+            body_text, mimetype="text/plain; charset=utf-8",
+            headers={"Content-Disposition":
+                     f'attachment; filename="fsearch_{ts}.txt"'})
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=EXPORT_COLUMNS,
+                                extrasaction="ignore")
+        writer.writeheader()
+        for doc in docs:
+            row = {c: doc.get(c, "") for c in EXPORT_COLUMNS}
+            for k, v in row.items():
+                if isinstance(v, list):
+                    row[k] = v[0] if v else ""
+            writer.writerow(row)
+        return Response(
+            buf.getvalue(), mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition":
+                     f'attachment; filename="fsearch_{ts}.csv"'})
+
+    # json
+    return Response(
+        json.dumps(docs, indent=2, default=str),
+        mimetype="application/json",
+        headers={"Content-Disposition":
+                 f'attachment; filename="fsearch_{ts}.json"'})
 
 
 @app.route("/api/content", methods=["POST"])

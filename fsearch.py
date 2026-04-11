@@ -22,6 +22,7 @@ Boolean combinations:
 import os
 import re
 import sys
+import csv
 import datetime
 import argparse
 import shutil
@@ -207,6 +208,66 @@ def fmt_date(s: str) -> str:
     return s[:10] if s else ""
 
 
+EXPORT_COLUMNS = ["filepath", "filename", "extension", "size_bytes",
+                  "mtime", "directory"]
+
+
+def _resolve_export_format(args) -> str:
+    """Return explicit --format or infer from --export file extension."""
+    if args.format:
+        return args.format.lower()
+    ext = Path(args.export).suffix.lower().lstrip(".")
+    if ext in ("csv", "txt", "json"):
+        return ext
+    raise ValueError(
+        f"Cannot infer export format from {args.export!r}; "
+        f"use --format csv|txt|json")
+
+
+def export_results(results, args) -> None:
+    """Write results to a file in csv, txt, or json format."""
+    fmt = _resolve_export_format(args)
+    out_path = Path(args.export).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    docs = list(results)
+
+    if fmt == "txt":
+        with out_path.open("w", encoding="utf-8") as f:
+            for doc in docs:
+                f.write(doc.get("filepath", "") + "\n")
+
+    elif fmt == "csv":
+        with out_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS,
+                                    extrasaction="ignore")
+            writer.writeheader()
+            for doc in docs:
+                row = {c: doc.get(c, "") for c in EXPORT_COLUMNS}
+                # Solr multi-valued fields come back as lists
+                for k, v in row.items():
+                    if isinstance(v, list):
+                        row[k] = v[0] if v else ""
+                writer.writerow(row)
+
+    elif fmt == "json":
+        import json
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(docs, f, indent=2, default=str)
+
+    else:
+        raise ValueError(f"Unknown export format: {fmt}")
+
+    if not args.quiet:
+        console.print(
+            f"[green]Exported[/green] {len(docs)} of {results.hits} "
+            f"results to [cyan]{out_path}[/cyan] ([yellow]{fmt}[/yellow])")
+        if results.hits > len(docs):
+            console.print(
+                f"[yellow]Note:[/yellow] result limit is {args.limit}; "
+                f"raise with --limit to export more.")
+
+
 def display_results(results, highlights=None, args=None):
     if args.quiet:
         for doc in results:
@@ -300,6 +361,12 @@ def main():
                     help="Print paths only (for piping)")
     ap.add_argument("--json",         dest="jsonout", action="store_true",
                     help="JSON output")
+    ap.add_argument("-o", "--export", metavar="FILE",
+                    help="Export results to FILE (format inferred from "
+                         "extension: .csv, .txt, .json)")
+    ap.add_argument("--format",       choices=["csv", "txt", "json"],
+                    help="Explicit export format (overrides extension). "
+                         "csv=all columns, txt=filepath only")
     ap.add_argument("--show-query",   action="store_true", default=False,
                     help="Print the generated Solr query (debug)")
     ap.add_argument("--solr-url",     default=SOLR_URL, help="Solr URL")
@@ -317,6 +384,14 @@ def main():
     except pysolr.SolrError as e:
         console.print(f"[red]Solr error:[/red] {e}")
         sys.exit(1)
+
+    if args.export:
+        try:
+            export_results(results, args)
+        except ValueError as e:
+            console.print(f"[red]Export error:[/red] {e}")
+            sys.exit(2)
+        return
 
     highlights = getattr(results, "highlighting", {})
     display_results(results, highlights, args)
