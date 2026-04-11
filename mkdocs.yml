@@ -1,0 +1,47 @@
+site_name: fsearch
+site_description: Solr-backed filesystem search with source abstraction
+site_author: Gerard Tromp
+repo_url: https://github.com/GerardTromp/solrIndexer
+repo_name: GerardTromp/solrIndexer
+edit_uri: edit/master/docs/
+
+theme:
+  name: readthedocs
+  highlightjs: true
+  hljs_languages:
+    - python
+    - bash
+    - yaml
+    - json
+  navigation_depth: 3
+  collapse_navigation: false
+  sticky_navigation: true
+
+nav:
+  - Home: index.md
+  - Overview:
+      - Architecture: overview/architecture.md
+      - Source abstraction: overview/sources.md
+  - Technical reference:
+      - CLI tools: technical/cli.md
+      - HTTP API: technical/api.md
+      - Solr schema: technical/schema.md
+      - Configuration: technical/configuration.md
+  - Vignettes:
+      - First install: vignettes/first-install.md
+      - Wiring up PST archives: vignettes/pst-wiring.md
+      - Wiring up Gmail: vignettes/gmail-wiring.md
+      - Wiring up Outlook (COM): vignettes/outlook-wiring.md
+      - Export & duplicate detection: vignettes/export-and-dedup.md
+  - Archive:
+      - Development notes 2026-03: archive/development_chat_20260330.md
+
+markdown_extensions:
+  - admonition
+  - def_list
+  - fenced_code
+  - tables
+  - toc:
+      permalink: true
+  - codehilite:
+      guess_lang: false
