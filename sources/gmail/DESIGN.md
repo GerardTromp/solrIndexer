@@ -1,7 +1,9 @@
 # Gmail source — design notes
 
 **Created**: 2026-04-11 (Phase 5)
-**Status**: implemented as a Gmail-API + refresh-token pull source
+**Updated**: 2026-04-11 (Phase 5.1 core: sqlite state DB, skip-if-known, mirror/archive)
+**Status**: implemented as a Gmail-API + refresh-token pull source, with
+Phase 5.1 correctness refinements applied
 
 This document records the choices behind the Gmail extractor and the
 options that were considered but not taken. Same purpose as the PST
@@ -197,7 +199,12 @@ manifest, NOT in the path — labels can change, paths shouldn't.
 
 ## Incremental state
 
-Persisted in `<output_root>/.gmail_state.json`:
+**Two state artifacts**, separated by lifetime:
+
+### `<output_root>/.gmail_state.json`
+
+Carries the Gmail history cursor. Rewritten atomically at the end of
+every run via `.tmp` + rename.
 
 ```json
 {
@@ -213,8 +220,151 @@ Persisted in `<output_root>/.gmail_state.json`:
 - `first_sync_completed`: distinguishes "no cursor → never run" from
   "no cursor → cursor expired, full re-sync needed".
 
-Atomic write via `.tmp` + rename so a crash mid-sync leaves the
-previous state intact.
+### `<output_root>/.gmail_state.sqlite` (Phase 5.1)
+
+Append-mostly ledger of "what messages we've already fetched". One row
+per message:
+
+```sql
+CREATE TABLE fetched (
+    msg_id       TEXT PRIMARY KEY,   -- Gmail message ID
+    relpath      TEXT NOT NULL,      -- .eml path relative to output root
+    internal_ms  INTEGER,            -- Gmail internalDate in ms (debug only)
+    fetched_at   TEXT                -- ISO8601 UTC, or "migrated" for
+                                     -- rows backfilled from an existing tree
+);
+```
+
+**Why sqlite instead of JSON**: the two state artifacts have opposite
+lifecycles. The cursor is rewritten whole every run; JSON's atomic-write
+pattern is perfect. The fetched ledger is append-mostly and grows
+monotonically; at 26k+ rows a JSON rewrite on every fetch is
+painful. Same reasoning as the Outlook COM exporter's state DB.
+
+**Why separate from the cursor JSON**: different semantics. Cursor
+loss doesn't invalidate the fetched ledger; losing the ledger shouldn't
+reset the cursor. Keeping them independent means each recovery scenario
+works cleanly.
+
+### Skip-if-known check
+
+`_fetch_and_save()` consults the state DB before making an API call:
+
+```python
+if _is_known(state_conn, msg_id):
+    return "skipped"
+```
+
+For a full-mailbox re-list after cursor loss, this turns a ~4-hour
+re-fetch into a ~40-second no-op — the list phase (52 API calls
+paging through message IDs) is the only thing that actually talks
+to Google. Empirically validated during Phase 5.1 bring-up with the
+author's 26k-message mailbox.
+
+### Migration helper
+
+On first invocation after upgrading from Phase 5 to 5.1, the state DB
+is absent but the `.eml` tree exists. `_migrate_existing_tree()`
+walks the tree, parses each filename for its embedded Gmail msg_id
+(regex: `<YYYY-MM-DD>_<16-char-msgid>.eml`), and backfills the DB
+with `fetched_at = "migrated"`.
+
+Gmail message IDs are 16-hex-char strings across current API output,
+so the filename suffix is losslessly round-trippable to the full
+msg_id. If a future Gmail API version changes ID format and produces
+longer IDs, the filename truncation would lose precision; the
+migration would still work (backfills the truncated prefix), but
+new fetches would write to a different filename than the migrated
+entry claims. Very low probability; documented here as a known
+edge case.
+
+Idempotent: uses `INSERT OR IGNORE`, so re-running the migration
+(e.g., if the DB was deleted) doesn't duplicate rows.
+
+## Mirror vs archive mode (Phase 5.1)
+
+Gmail history events include both message additions and deletions.
+The script has to decide what to do when it sees a `messagesDeleted`
+event for something it has locally.
+
+### Option A — Mirror mode (opt-in)
+
+Honor the delete: remove the state DB row, delete the `.eml` file
+from disk, remove the manifest entry. The next `fs_indexer.py` run's
+purge pass notices the file is gone and removes the Solr doc.
+
+Behavior matches what a naive user expects: "I deleted this email
+from Gmail, so my search shouldn't find it anymore."
+
+### Option B — Archive mode (default)
+
+Log the delete event, DO NOT remove the local file. The `.eml`
+stays on disk, the state DB row stays, the manifest entry stays,
+the Solr doc stays. A future `--list-orphaned` or similar tool
+could surface what Gmail has forgotten but we still remember, if
+that's ever useful.
+
+Behavior: "my search archive accumulates over time; Gmail deletes
+don't erase history."
+
+### Why archive is the default
+
+**The causal-chain argument**: once a message has been fetched
+into fsearch, there are three separate states to consider —
+
+1. The message exists on Gmail's servers
+2. There's an `.eml` file on our disk
+3. There's a Solr doc pointing at that file
+
+In archive mode, state 2 is authoritative for state 3 — Solr reflects
+what's on disk, period. Gmail state (1) only affects future fetches,
+not existing data. This is a clean, one-way data flow.
+
+In mirror mode, state 1 also affects state 2, which indirectly
+affects state 3 via the purge pass. Two arrows of causality, both
+pointing at the same local state. This is fine when everything works,
+but failure modes are worse:
+
+- **Accidental Gmail delete** (clicked the wrong thing, or an abusive
+  process got access to your Google account): the local archive
+  erases itself to match. In archive mode you'd notice the problem
+  and still have the local copy to recover from.
+- **Gmail service glitch** returning a false `messagesDeleted` event:
+  same outcome — local data destroyed to match a transient upstream
+  state.
+- **Attacker with account access**: a malicious login can erase
+  local search archives by issuing Gmail deletes. Archive mode
+  closes this escalation path.
+
+The asymmetry matters: a stale-but-present local archive is an
+inconvenience. A missing local archive when you needed it is an
+incident. Optimize for the worse failure mode.
+
+**Users who want mirror mode** are technical enough to know they
+want it. They can opt in by setting
+`FSEARCH_GMAIL_MIRROR=true` in their cron environment or shell.
+The sync logs the mode on every run:
+
+```
+Mirror mode enabled (FSEARCH_GMAIL_MIRROR) — Gmail deletes will prune local files
+```
+
+**Users who haven't thought about it** get the safe default with no
+surprises. If they notice deleted Gmail messages still showing up
+in fsearch and want the other behavior, a one-line env var change
+fixes it.
+
+### Cursor-loss interaction
+
+When the history cursor expires (>7 days since last sync) and the
+script falls back to a full re-list, **delete events are not
+available** — `users.history.list` returns only what happened after
+the given cursor, and we've lost ours. In that case, the script
+clears the `deleted_ids` list and skips the delete-processing pass
+entirely. Mirror-mode users will see the warning message
+"can't trust history deletes after cursor loss" in the logs and
+know that one sync window of deletes was silently dropped. Next
+run with a fresh cursor resumes normal delete handling.
 
 ## What this source does NOT do
 

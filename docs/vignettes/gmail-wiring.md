@@ -219,13 +219,56 @@ fsearch -q '(source_name:gmail OR source_kind:pst) AND content:project'
 - **History cursor expiration**: if the script hasn't run for a week
   or more, the cursor expires and Google's history endpoint returns
   404. The script detects this, logs a warning, and falls back to a
-  full re-list on the next run. No manual intervention needed.
+  full re-list on the next run. Thanks to the Phase 5.1 state DB,
+  the re-list only re-fetches truly new messages — the 26k existing
+  messages are skipped via `_is_known` and recovery is under a
+  minute, not hours.
 - **Adding / removing labels in Gmail** is NOT reflected in fsearch
   until the message is re-fetched. Gmail's history only reports
-  `messagesAdded`; label changes are intentionally ignored for
-  simplicity. If you need label accuracy, run `sync.py --full`
-  (not implemented yet — would need a small flag addition) or
-  delete the state file to trigger a full re-sync.
+  `messagesAdded` and `messagesDeleted`; label-only changes are
+  intentionally ignored for simplicity. If you need label accuracy,
+  delete `<output>/.gmail_state.sqlite` (not the JSON cursor) to
+  force a full re-fetch on the next run.
+
+## Archive vs mirror mode
+
+Gmail history includes delete events. The script has two policies for
+what to do with them:
+
+**Archive mode (default)**: log the delete, keep the local `.eml`
+file. Your fsearch results reflect a growing local archive; Gmail
+deletes don't erase history. Safest default — an accidental Gmail
+delete (or worse, an attacker with account access) can't wipe your
+search archive.
+
+**Mirror mode**: honor the delete. Remove the `.eml` file, drop the
+state DB row and manifest entry. The next `fs_indexer.py` run's
+purge pass then removes the Solr doc. Your fsearch results mirror
+Gmail state exactly.
+
+Enable mirror mode with an env var:
+
+```bash
+export FSEARCH_GMAIL_MIRROR=true
+```
+
+(or `1`, `yes`, `on` — any truthy value works)
+
+Every run logs its mode on startup:
+
+```
+Mirror mode enabled (FSEARCH_GMAIL_MIRROR) — Gmail deletes will prune local files
+```
+or
+```
+Archive mode: ignored 9 upstream delete(s). Set FSEARCH_GMAIL_MIRROR=true to propagate deletes locally.
+```
+
+The rationale for "archive is the default" is captured at length in
+`sources/gmail/DESIGN.md` ("Mirror vs archive mode" section) —
+short version: when things go wrong, the worst outcome of mirror
+mode (missing local data) is much worse than the worst outcome of
+archive mode (stale local data).
 
 ## Troubleshooting
 

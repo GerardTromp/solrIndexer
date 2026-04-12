@@ -21,6 +21,12 @@ Environment variables (all required for normal runs):
                              (default: ~/.config/fsearch/gmail_token.json)
   FSEARCH_GMAIL_STATE        sync state file (history cursor)
                              (default: <output>/.gmail_state.json)
+  FSEARCH_GMAIL_STATE_DB     sqlite DB of fetched messages (Phase 5.1)
+                             (default: <output>/.gmail_state.sqlite)
+  FSEARCH_GMAIL_MIRROR       if "true"/"1"/"yes", honor upstream Gmail
+                             deletes by removing the corresponding .eml
+                             file locally. Default is archive mode: local
+                             files survive upstream deletes. See DESIGN.md.
   FSEARCH_GMAIL_LOG_LEVEL    DEBUG | INFO | WARNING (default INFO)
 
 One-time setup: see DESIGN.md "Setup checklist" section.
@@ -38,6 +44,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -74,9 +81,13 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 MANIFEST_FILENAME = ".manifest.json"
 STATE_FILENAME = ".gmail_state.json"
+STATE_DB_FILENAME = ".gmail_state.sqlite"
 
 # Filter out drafts and chat — see DESIGN.md "What this source does NOT do"
 EXCLUDED_LABELS = {"DRAFT", "CHAT", "SPAM", "TRASH"}
+
+# Env-var truthy values for FSEARCH_GMAIL_MIRROR
+_TRUTHY = {"1", "true", "yes", "on"}
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -100,6 +111,13 @@ def _load_config() -> dict:
         "FSEARCH_GMAIL_TOKEN", creds_dir / "gmail_token.json"))
     state_path = Path(os.environ.get(
         "FSEARCH_GMAIL_STATE", output_root / STATE_FILENAME))
+    state_db_path = Path(os.environ.get(
+        "FSEARCH_GMAIL_STATE_DB", output_root / STATE_DB_FILENAME))
+
+    # Archive mode is the default. Mirror mode (opt-in) propagates
+    # Gmail deletes to the local .eml tree. See DESIGN.md for the
+    # causal-chain rationale.
+    mirror_mode = os.environ.get("FSEARCH_GMAIL_MIRROR", "").lower() in _TRUTHY
 
     output_root.mkdir(parents=True, exist_ok=True)
     if not os.access(output_root, os.W_OK):
@@ -107,10 +125,12 @@ def _load_config() -> dict:
         sys.exit(2)
 
     return {
-        "output_root": output_root,
-        "creds_path":  creds_path,
-        "token_path":  token_path,
-        "state_path":  state_path,
+        "output_root":   output_root,
+        "creds_path":    creds_path,
+        "token_path":    token_path,
+        "state_path":    state_path,
+        "state_db_path": state_db_path,
+        "mirror_mode":   mirror_mode,
     }
 
 
@@ -199,6 +219,141 @@ def _save_state(path: Path, state: dict) -> None:
     tmp.replace(path)
 
 
+# ── State DB (Phase 5.1: skip-if-known ledger) ──────────────────────────────
+#
+# Separate from the JSON cursor state file: the JSON carries the Gmail
+# history cursor (a single int, rewritten every run), the sqlite is the
+# "what's on disk" ledger (append-mostly, one row per fetched message).
+# Matches the Outlook COM exporter's pattern for the same reason:
+# tens-of-thousands of entries make JSON atomic writes painful.
+
+def _open_state_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fetched (
+            msg_id      TEXT PRIMARY KEY,
+            relpath     TEXT NOT NULL,
+            internal_ms INTEGER,
+            fetched_at  TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _is_known(conn: sqlite3.Connection, msg_id: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM fetched WHERE msg_id = ? LIMIT 1", (msg_id,))
+    return cur.fetchone() is not None
+
+
+def _record_fetched(conn: sqlite3.Connection, msg_id: str,
+                    relpath: str, internal_ms: int) -> None:
+    conn.execute("""
+        INSERT OR REPLACE INTO fetched
+            (msg_id, relpath, internal_ms, fetched_at)
+        VALUES (?, ?, ?, ?)
+    """, (msg_id, relpath, internal_ms,
+          time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+
+
+def _forget_fetched(conn: sqlite3.Connection, msg_id: str) -> str | None:
+    """
+    Remove a message from the state DB. Returns the relpath that was
+    recorded for it (caller uses this to delete the actual .eml file
+    in mirror mode). Returns None if the msg_id wasn't tracked.
+    """
+    cur = conn.execute(
+        "SELECT relpath FROM fetched WHERE msg_id = ?", (msg_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    conn.execute("DELETE FROM fetched WHERE msg_id = ?", (msg_id,))
+    return row[0]
+
+
+def _apply_delete(state_conn: sqlite3.Connection, output_root: Path,
+                  msg_id: str, manifest_entries: dict) -> bool:
+    """
+    Mirror-mode delete handler: remove the state DB row AND the .eml
+    file on disk AND the manifest entry, so the next fs_indexer run's
+    purge pass notices the file is gone and deletes the Solr doc.
+
+    Archive mode never calls this — see DESIGN.md "Mirror vs archive"
+    for the causal-chain argument. Returns True if anything was
+    removed.
+    """
+    relpath = _forget_fetched(state_conn, msg_id)
+    if relpath is None:
+        return False
+    eml_path = output_root / relpath
+    try:
+        eml_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning(f"Could not delete {eml_path}: {e}")
+    manifest_entries.pop(relpath, None)
+    return True
+
+
+# Filename pattern: "<yyyy-mm-dd>_<16-char-msgid>.eml"
+# Gmail message IDs are 16-hex-char strings across current API output,
+# so the filename suffix is losslessly round-trippable to the msg_id.
+# See DESIGN.md "Migration helper" for the edge cases.
+_EML_FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_([A-Za-z0-9]{1,32})\.eml$")
+
+
+def _msg_id_from_filename(filename: str) -> str | None:
+    m = _EML_FILENAME_RE.match(filename)
+    return m.group(1) if m else None
+
+
+def _migrate_existing_tree(conn: sqlite3.Connection,
+                           output_root: Path) -> int:
+    """
+    Backfill the state DB from an existing on-disk .eml tree. Used on
+    first invocation after upgrading from Phase 5 to 5.1. Walks
+    output_root, parses each filename for its embedded msg_id, and
+    inserts a row. Returns the number of rows inserted.
+
+    Idempotent: rows for already-known msg_ids are left untouched
+    (INSERT OR IGNORE). Safe to re-run even if the DB is partially
+    populated.
+    """
+    n_inserted = 0
+    for eml in output_root.rglob("*.eml"):
+        msg_id = _msg_id_from_filename(eml.name)
+        if not msg_id:
+            continue
+        try:
+            rel = eml.relative_to(output_root).as_posix()
+        except ValueError:
+            continue
+        # Derive a plausible internal_ms from the filename date prefix
+        # for sanity — this is only used for debug; fresh fetches will
+        # overwrite with the real Gmail internalDate value.
+        try:
+            date_part = eml.name[:10]
+            dt = datetime.strptime(date_part, "%Y-%m-%d")
+            internal_ms = int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except (ValueError, OSError):
+            internal_ms = 0
+        try:
+            cur = conn.execute("""
+                INSERT OR IGNORE INTO fetched
+                    (msg_id, relpath, internal_ms, fetched_at)
+                VALUES (?, ?, ?, ?)
+            """, (msg_id, rel, internal_ms, "migrated"))
+            if cur.rowcount > 0:
+                n_inserted += 1
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    return n_inserted
+
+
 # ── On-disk message paths ──────────────────────────────────────────────────
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
@@ -253,13 +408,19 @@ def _list_all_message_ids(service) -> list[str]:
     return ids
 
 
-def _list_history_changes(service, start_id: str) -> tuple[list[str], str | None]:
+def _list_history_changes(service, start_id: str
+                          ) -> tuple[list[str], list[str], str | None]:
     """
-    Return (added_message_ids, latest_history_id). Returns ([], None)
-    on cursor-expired (HTTP 404), signaling the caller to fall back
-    to a full re-list.
+    Return (added_message_ids, deleted_message_ids, latest_history_id).
+    Returns ([], [], None) on cursor-expired (HTTP 404), signaling the
+    caller to fall back to a full re-list.
+
+    Phase 5.1: also captures `messagesDeleted` events so mirror mode
+    can prune local files when Gmail state changes. In archive mode
+    (the default) the caller ignores the deleted list.
     """
     added: list[str] = []
+    deleted: list[str] = []
     latest_history_id: str | None = None
     page_token = None
     try:
@@ -267,7 +428,7 @@ def _list_history_changes(service, start_id: str) -> tuple[list[str], str | None
             req = service.users().history().list(
                 userId="me",
                 startHistoryId=start_id,
-                historyTypes=["messageAdded"],
+                historyTypes=["messageAdded", "messageDeleted"],
                 pageToken=page_token,
             )
             resp = req.execute()
@@ -281,6 +442,10 @@ def _list_history_changes(service, start_id: str) -> tuple[list[str], str | None
                     if label_ids & EXCLUDED_LABELS:
                         continue
                     added.append(msg["id"])
+                for m in h.get("messagesDeleted", []):
+                    msg = m.get("message", {})
+                    if msg and msg.get("id"):
+                        deleted.append(msg["id"])
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
@@ -289,32 +454,47 @@ def _list_history_changes(service, start_id: str) -> tuple[list[str], str | None
             log.warning(
                 "History cursor expired (older than ~7 days). "
                 "Will fall back to a full re-list on next run.")
-            return [], None
+            return [], [], None
         raise
-    return added, latest_history_id
+    return added, deleted, latest_history_id
 
 
 def _fetch_and_save(service, msg_id: str, output_root: Path,
-                    manifest_entries: dict) -> bool:
+                    manifest_entries: dict,
+                    state_conn: sqlite3.Connection) -> str:
     """
     Fetch one message in raw form, base64url-decode it, write the .eml,
-    and append a manifest entry. Returns True on success.
+    append a manifest entry, and record the fetch in the state DB.
+
+    Returns one of:
+      "fetched"  — new API fetch succeeded, file + DB row written
+      "skipped"  — already in state DB, no API call made
+      "failed"   — any error, including transient API failures
+
+    The Phase-5 predecessor returned a bool (True/False); the three-way
+    result lets main() distinguish "skipped for free" from "actually
+    worked" for accurate reporting.
     """
+    # Skip-if-known check — Phase 5.1 core value. For a 26k-message
+    # mailbox this turns a ~4h foreground recovery into a ~5s no-op.
+    if _is_known(state_conn, msg_id):
+        return "skipped"
+
     try:
         msg = service.users().messages().get(
             userId="me", id=msg_id, format="raw").execute()
     except HttpError as e:
         log.debug(f"Fetch failed for {msg_id}: {e}")
-        return False
+        return "failed"
 
     raw = msg.get("raw", "")
     if not raw:
-        return False
+        return "failed"
     try:
         eml_bytes = base64.urlsafe_b64decode(raw.encode("ascii"))
     except Exception as e:
         log.debug(f"Base64 decode failed for {msg_id}: {e}")
-        return False
+        return "failed"
 
     internal_date_ms = int(msg.get("internalDate", "0") or "0")
     eml_path = _eml_path_for(output_root, internal_date_ms, msg_id)
@@ -327,14 +507,20 @@ def _fetch_and_save(service, msg_id: str, output_root: Path,
     # Manifest enrichment: parse only the headers (cheap), and pull
     # Gmail-specific labels/threadId from the API response.
     entry = _build_manifest_entry(eml_bytes, msg, eml_path, output_root)
+    relpath = ""
     if entry:
         try:
-            rel = eml_path.resolve().relative_to(output_root.resolve())
-            manifest_entries[rel.as_posix()] = entry
+            relpath = eml_path.resolve().relative_to(
+                output_root.resolve()).as_posix()
+            manifest_entries[relpath] = entry
         except (ValueError, OSError):
             pass
 
-    return True
+    # Record the fetch in the state DB. This is what makes skip-if-known
+    # work on the next run. Commit happens in batches in main() to avoid
+    # one fsync per message.
+    _record_fetched(state_conn, msg_id, relpath, internal_date_ms)
+    return "fetched"
 
 
 _HEADER_PARSER = BytesHeaderParser()
@@ -499,17 +685,40 @@ def main() -> int:
     # we captured at fetch time survives the sync.
     manifest_entries = _load_manifest(output_root)
 
+    # ── State DB (Phase 5.1) ─────────────────────────────────────────────
+    # Skip-if-known ledger: one row per msg_id we've already fetched.
+    # On first invocation after upgrading from Phase 5 (DB absent but
+    # .eml files exist), backfill the DB from the on-disk tree so the
+    # upgrade is transparent — no forced re-fetch of 26k messages.
+    db_existed = cfg["state_db_path"].exists()
+    state_conn = _open_state_db(cfg["state_db_path"])
+
+    if not db_existed:
+        log.info("State DB absent — checking for existing .eml tree to migrate")
+        n_migrated = _migrate_existing_tree(state_conn, output_root)
+        if n_migrated:
+            log.info(
+                f"Migrated {n_migrated:,} existing files to state DB "
+                f"(Phase 5.0 → 5.1 upgrade path)")
+
+    if cfg["mirror_mode"]:
+        log.info("Mirror mode enabled (FSEARCH_GMAIL_MIRROR) — "
+                 "Gmail deletes will prune local files")
+
     # ── Determine what to fetch ──────────────────────────────────────────
     history_id = state.get("history_id")
     first_done = state.get("first_sync_completed", False)
+    deleted_ids: list[str] = []
 
     if history_id and first_done:
         log.info(f"Incremental sync from history_id={history_id}")
-        added, new_history_id = _list_history_changes(service, history_id)
+        added, deleted_ids, new_history_id = _list_history_changes(
+            service, history_id)
         if new_history_id is None:
             # cursor expired — fall through to full re-list
             log.info("Falling back to full message list")
             ids_to_fetch = _list_all_message_ids(service)
+            deleted_ids = []   # can't trust history deletes after cursor loss
         else:
             ids_to_fetch = added
     else:
@@ -518,15 +727,45 @@ def main() -> int:
 
     log.info(f"Fetching {len(ids_to_fetch)} message(s)")
 
-    n_ok = 0
+    n_fetched = 0
+    n_skipped = 0
     n_fail = 0
-    for i, mid in enumerate(ids_to_fetch, 1):
-        if _fetch_and_save(service, mid, output_root, manifest_entries):
-            n_ok += 1
-        else:
-            n_fail += 1
-        if i % 100 == 0:
-            log.info(f"  fetched {i}/{len(ids_to_fetch)}")
+    try:
+        for i, mid in enumerate(ids_to_fetch, 1):
+            result = _fetch_and_save(
+                service, mid, output_root, manifest_entries, state_conn)
+            if result == "fetched":
+                n_fetched += 1
+            elif result == "skipped":
+                n_skipped += 1
+            else:
+                n_fail += 1
+
+            # Commit the state DB periodically so a Ctrl-C doesn't lose
+            # the last few hundred fetches. Balance between durability
+            # and fsync overhead.
+            if i % 100 == 0:
+                state_conn.commit()
+                log.info(
+                    f"  progress {i}/{len(ids_to_fetch)} "
+                    f"(fetched={n_fetched} skipped={n_skipped} failed={n_fail})")
+    finally:
+        state_conn.commit()
+
+    # ── Mirror-mode delete processing ────────────────────────────────────
+    n_deleted_locally = 0
+    if cfg["mirror_mode"] and deleted_ids:
+        log.info(
+            f"Processing {len(deleted_ids)} upstream delete(s) (mirror mode)")
+        for mid in deleted_ids:
+            if _apply_delete(state_conn, output_root, mid, manifest_entries):
+                n_deleted_locally += 1
+        state_conn.commit()
+        log.info(f"Mirrored {n_deleted_locally} delete(s) locally")
+    elif deleted_ids and not cfg["mirror_mode"]:
+        log.info(
+            f"Archive mode: ignored {len(deleted_ids)} upstream delete(s). "
+            f"Set FSEARCH_GMAIL_MIRROR=true to propagate deletes locally.")
 
     # ── Persist state ────────────────────────────────────────────────────
     # Get the current profile's historyId so the next run knows where to
@@ -555,11 +794,20 @@ def main() -> int:
         _write_manifest(output_root, manifest)
     except OSError as e:
         log.error(f"Manifest write failed: {e}")
+        state_conn.close()
         return 2
 
-    log.info(f"Done: ok={n_ok} failed={n_fail} total_in_manifest={len(manifest_entries)}")
+    state_conn.close()
 
-    if n_fail and n_ok == 0:
+    log.info(
+        f"Done: fetched={n_fetched} skipped_known={n_skipped} "
+        f"failed={n_fail} deleted_local={n_deleted_locally} "
+        f"total_in_manifest={len(manifest_entries)}"
+    )
+
+    # Only count real work when deciding partial/full failure:
+    # "skipped_known" is the happy path for incremental runs.
+    if n_fail and n_fetched == 0 and n_skipped == 0:
         return 2
     if n_fail:
         return 1
