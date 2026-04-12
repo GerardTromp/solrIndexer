@@ -517,7 +517,17 @@ few days costs nothing meaningful.
    migration helper, archive/mirror toggle. Details below. The
    substantive correctness work.
 
-3. **Phase 5.1.6 fetch optimization** (2–6 hr) — benchmark script
+3. **Phase 5.1.5a — `sync.py --prune` CLI** (~2 hr) — the hard-delete
+   tool. Takes a list of filepaths, removes each from disk + state
+   DB + manifest atomically. Source-agnostic philosophy: doesn't
+   know how the list was produced. See Phase 5.1.5 section below.
+
+4. **Phase 5.1.5b — GUI curation clipboard** (~3–4 hr) — PubMed-style
+   session clipboard for accumulating "messages to delete" across
+   multiple searches. Exports to TXT which feeds 5.1.5a. See Phase
+   5.1.5 section below.
+
+5. **Phase 5.1.6 fetch optimization** (2–6 hr) — benchmark script
    first, measurement, then implementation only if decision
    thresholds are met. The `benchmark_fetch.py` tool is a **permanent
    commitment**: it stays in the repo alongside the chosen
@@ -525,7 +535,7 @@ few days costs nothing meaningful.
    logic changes (auth library updates, Google API shifts, quota
    adjustments). Not a throwaway one-off.
 
-4. **Production cron wiring** (~30 min) — migrate `run_index.sh`
+6. **Production cron wiring** (~30 min) — migrate `run_index.sh`
    from positional roots to a `sources.yaml`-driven model, adding
    the Gmail source entry. Done LAST so cron only picks up a
    fully-vetted integration.
@@ -679,6 +689,318 @@ entry under "When deletes matter" explaining the knob.
 **Estimate**: 3–5 hours. Includes DESIGN.md update, docs update,
 and manual upgrade-path testing. No new dependencies.
 
+---
+
+## Phase 5.1.5 — Curation workflow
+
+**Goal**: support the "find-review-curate-act" workflow where a user
+searches for email they think should be deleted, reviews the hits,
+accumulates a list across multiple searches, then uses that list
+to drive a hard delete of both the remote Gmail messages (via the
+Gmail web UI — outside fsearch) AND the local `.eml` archive + Solr
+docs (via fsearch).
+
+**Workflow end to end**:
+
+1. Search by keywords, date ranges, sender, etc. in the web GUI
+2. Review hits, optionally click rows to preview content
+3. Check boxes next to messages that should be deleted
+4. Click "Send to clipboard" — checked items join a session-scoped
+   clipboard, checkboxes clear
+5. Repeat 1-4 across as many searches as needed
+6. Open the clipboard page, review full list, remove any
+   mistaken entries via "Remove from clipboard"
+7. Export clipboard as a TXT file (one filepath per line)
+8. Delete the messages from Gmail via its web interface
+9. Feed the TXT file to `sync.py --prune` which atomically removes
+   each `.eml` from disk, its row from the state DB, and its
+   manifest entry. The next `fs_indexer.py` run's purge pass
+   removes the Solr doc.
+
+Steps 1-7 are client-side curation. Steps 8-9 are the hard-delete
+trigger. Keeping the destructive action in a separate CLI step
+(not a GUI button) is deliberate — see "Rejected alternatives"
+below.
+
+**Two independent deliverables**, built in this order:
+
+---
+
+### 5.1.5a — `sync.py --prune` (CLI)
+
+Ship first. ~100 LOC. Can be used immediately with manually-assembled
+lists (e.g., paths copied from the existing "Copy path" row button
+and pasted into a text file), so the hard-delete path gets validated
+in isolation before any GUI wraps it.
+
+**Interface**:
+
+```bash
+/opt/fsearch/sources/gmail/sync.py --prune <file>
+/opt/fsearch/sources/gmail/sync.py --prune -      # read from stdin
+```
+
+Input format: one filepath per line. Lines starting with `#` are
+comments. Blank lines skipped. Paths must be absolute. Each path
+must match either a relative path under FSEARCH_GMAIL_OUTPUT OR an
+absolute path that's inside FSEARCH_GMAIL_OUTPUT — rejecting paths
+outside the source root is a safety check against fat-fingered
+copy-paste deleting random files.
+
+**Semantics** per path:
+
+1. Resolve and validate (must be under output root, must exist or
+   its state DB row must exist — a ghosted row with missing file is
+   still cleanable)
+2. Compute relative path from output root
+3. Begin transaction on the state DB
+4. Look up the msg_id by relpath (SELECT msg_id FROM fetched WHERE
+   relpath = ?)
+5. Delete the state DB row
+6. Delete the `.eml` file on disk (unlink; ignore FileNotFoundError)
+7. Commit transaction
+8. Remove the entry from `.manifest.json` (in-memory, rewritten once
+   at the end for all processed paths, atomic via `.tmp` + rename)
+
+**Failure handling**:
+
+- Per-path errors (not found, path outside root, state DB row missing
+  AND file missing): log warning, continue with next path
+- Unreadable input file or unwritable state DB: hard fail
+- If the manifest rewrite fails at the end, the individual `.eml`
+  + state DB removals stay (they're already committed). Log an
+  error and exit nonzero. Next run will reconcile — the manifest
+  will have stale entries pointing at missing files, which is
+  handled gracefully by the Phase 3 manifest reader (missing files
+  return no entry).
+
+**Reporting**: print a summary line like
+`Pruned: 47 successful, 2 skipped, 0 failed`. Exit 0 on full
+success, 1 on partial, 2 on hard failure.
+
+**Explicitly NOT done by this command**:
+
+- Does NOT talk to Gmail. You delete from Gmail separately. If you
+  run `sync.py --prune` without first deleting from Gmail, the next
+  incremental sync will happily re-download the messages you just
+  pruned (because Gmail still has them; the history cursor will
+  report them as "added"). That's recoverable, just wasteful — a
+  note in the DESIGN.md addition below makes this ordering
+  requirement explicit.
+- Does NOT remove the Solr document. fsearch's existing per-source
+  purge pass (scoped by `source_name`) handles that on the next
+  `fs_indexer.py` run.
+- Does NOT modify the history cursor. Pruning doesn't advance time.
+
+**Safety features**:
+
+- Dry-run flag: `--prune-dry-run FILE` prints what would happen
+  without touching disk or DB. Recommended for every first use.
+- A confirmation prompt when run interactively (`isatty()`) for
+  >10 paths. Skipped when reading from a pipe (for scripting).
+  Override with `--yes`.
+
+**Files touched**:
+- `sources/gmail/sync.py` — new `--prune` / `--prune-dry-run` /
+  `--yes` flags, new `_prune_from_file()` function
+- `sources/gmail/DESIGN.md` — new "Destructive operations" section
+  documenting the ordering requirement and why GUI doesn't have a
+  delete button
+- `docs/vignettes/gmail-wiring.md` — new "Pruning messages" section
+
+**Acceptance criteria**:
+
+1. Feed a TXT file with 5 valid paths → all 5 removed atomically,
+   exit 0.
+2. Feed a file with 1 valid + 1 path outside the source root → the
+   valid path is pruned, the invalid one is rejected with a clear
+   error, exit 1 (partial).
+3. `--prune-dry-run` with the same inputs reports what would happen
+   and returns exit 0 without touching anything.
+4. Next `fs_indexer.py` run's purge pass removes the corresponding
+   Solr docs via the `source_name:gmail` cursor scan (existing
+   Phase 2 logic — just verify it still works with the new
+   filesystem state).
+
+**Estimate**: 2 hours.
+
+---
+
+### 5.1.5b — GUI curation clipboard
+
+Ship after 5.1.5a validates the hard-delete path. ~300 LOC split
+between `static/search.html` (JS+CSS) and one small new endpoint
+in `fsearch_web.py`.
+
+**Storage model**: `sessionStorage` keyed by browser tab. Single
+clipboard (not multi-named — PubMed-style). Dies when the tab
+closes. No time-based expiry. No auto-save to disk.
+
+**Clipboard contents**: a list of Solr `id` strings (which is also
+the filepath in our schema). IDs only, not cached metadata — the
+clipboard page fetches fresh doc data from Solr when opened, so
+any doc that's been re-indexed (hash update, source_timestamp
+correction, etc.) shows its latest state.
+
+**UI elements added to `static/search.html`**:
+
+- **Checkbox column** (leftmost) in the results table. Narrow
+  (~30px). Row checkbox `onclick` calls `stopPropagation()` so the
+  existing click-to-expand-preview behavior still works on the row
+  body.
+- **Header checkbox**: "select/deselect all visible results".
+  Applies only to current page, not to anything else.
+- **Visual marker on rows already in the clipboard**: a
+  pre-rendered "✓ In clipboard" indicator instead of a clickable
+  checkbox, with tooltip, so the user can see "I already caught
+  this one in an earlier search". Prevents re-adding duplicates
+  and makes repeat queries useful for coverage-checking.
+- **"Send to clipboard (N)" button** in the controls bar, alongside
+  the existing Search / Add row / NOT→end / Clear / Export CSV /
+  Export TXT buttons. Disabled when zero checkboxes are checked.
+  Shows the pending-check count in its label.
+- **Clipboard badge** in the top-right of the controls bar: `📋 47`.
+  Clickable — opens the clipboard page. Updates live via a custom
+  `clipboardchange` event dispatched on the window.
+
+**Clipboard page** (modal overlay):
+
+- Fetches full doc metadata via new `POST /api/docs_by_id` endpoint
+  (see below). Batches if more than ~500 IDs to stay under Solr's
+  default 1024-clause limit.
+- Renders a table matching the main results layout: path, ext,
+  size, modified. Each row has a ✕ button to remove from clipboard.
+- Page-level actions: **Clear clipboard**, **Export CSV**,
+  **Export TXT**, **Export JSON**. All exports are assembled
+  client-side from the already-fetched docs — no new server-side
+  export endpoint.
+- Close button or click-outside-modal to dismiss.
+
+**New Flask endpoint** — `POST /api/docs_by_id`:
+
+- Request body: `{"ids": ["...", "..."]}`
+- Uses Solr's `{!terms f=id}value1,value2,...` syntax which handles
+  up to several thousand values per query by default (much more
+  than `q=id:(a OR b OR ...)` with its 1024 Boolean clauses limit)
+- Returns same doc shape as `/api/search` for consistency (same
+  `fl` list: filepath, filename, size, mtime, extension, directory,
+  content_preview, content_sha256, language, mimetype_detected,
+  source_name, source_kind, source_timestamp, source_metadata)
+- If more than ~1000 IDs, batches internally and merges results
+
+**Export formats from the clipboard** (client-side assembly):
+
+- **CSV**: same column set as the existing `EXPORT_COLUMNS` list in
+  `fsearch_web.py` and `fsearch.py` — filepath, filename, extension,
+  size_bytes, mtime, directory, content_sha256, language,
+  mimetype_detected. Header row included.
+- **TXT**: one filepath per line. This is the format `sync.py --prune`
+  consumes, so it's the direct-pipeline export.
+- **JSON**: array of full doc dicts.
+
+Filename format: `fsearch_clipboard_YYYYMMDD_HHMMSS.{ext}`.
+
+**Files touched**:
+- `static/search.html` — biggest change, ~250 lines of JS for
+  clipboard module + UI wiring + clipboard-page rendering + export
+- `fsearch_web.py` — one new endpoint (~30 lines)
+- `docs/vignettes/gmail-wiring.md` — new "Curation workflow" section
+  showing the full 1-9 step flow end-to-end
+
+**Acceptance criteria**:
+
+1. Search → check 3 rows → Send to clipboard → badge shows "3".
+   Checkboxes on those 3 rows clear. Run a new search that includes
+   one of those 3 rows in its results — that row shows "✓ In
+   clipboard" indicator instead of a checkbox.
+2. Open clipboard page → see 3 rows with full metadata. Remove one
+   via ✕ → badge drops to "2".
+3. Export TXT → download a file with 2 filepaths, one per line.
+4. Feed that TXT to `sync.py --prune` → both messages removed from
+   state DB, disk, and manifest. Next fs_indexer run purges Solr
+   docs. Clipboard is still populated (export doesn't clear), but
+   a new search shows those rows are gone.
+5. Close the tab → open fsearch in a new tab → clipboard is empty
+   (`sessionStorage` scoping).
+6. "Clear clipboard" on the clipboard page → empties the clipboard
+   immediately.
+
+**Explicitly NOT in this phase**:
+
+- **Per-clipboard naming** ("receipts", "newsletters", ...): YAGNI.
+  If a curation session needs multiple categories, do multiple
+  export+prune cycles.
+- **Saving clipboard state to disk**: sessionStorage only. The
+  "export to TXT" path already serves as a save mechanism for
+  anyone who wants persistence.
+- **A GUI delete button**: destructive operations stay in the CLI.
+  The GUI is read-only and curation-only, which keeps the blast
+  radius of a browser bug or a misclick near-zero.
+- **Selecting checkboxes across pages without "Send to clipboard"
+  in between**: explicit commit required per page. This avoids
+  losing pending selections when pagination changes the result
+  set.
+- **Keyboard shortcuts** for check all / send: the existing
+  Ctrl+Enter / Ctrl+Shift+A shortcuts are enough for v1.
+
+**Estimate**: 3–4 hours.
+
+---
+
+### Rejected alternatives for Phase 5.1.5 (the whole phase)
+
+**GUI delete button** — a "Delete from clipboard + disk + Solr"
+button on the clipboard page. Tempting because it collapses steps
+7-9 into one click. Rejected because:
+
+- Destructive operations deserve friction. A one-click delete
+  against 500 messages is a foot-gun even with "Are you sure?"
+  dialogs.
+- The CLI step also enforces a natural "did you actually delete
+  these from Gmail first?" pause.
+- The separation makes the hard-delete path auditable. The TXT
+  export file is a record of what was destroyed; running `--prune
+  --prune-dry-run file.txt` and diffing its output against the
+  real `--prune` run gives you a sanity check that no other process
+  modified state between steps.
+
+**Automatic Gmail delete via API** — have `sync.py --prune` also
+delete the messages from Gmail. Rejected because:
+
+- Would require re-scoping the OAuth credentials from `gmail.readonly`
+  to `gmail.modify`, which is a much broader permission and a much
+  scarier test-user consent dialog.
+- The user-visible workflow benefits from Gmail's UI for the
+  review-before-delete step — bulk operations in the Gmail web UI
+  are well-understood and have their own undo affordances.
+- The hard coupling would mean a bug in `--prune` could irreversibly
+  destroy email. Keeping the two systems separate means a bad
+  `--prune` only destroys local state, which can be re-fetched via
+  a standard sync.
+
+**Per-named clipboards** — like the "Collections" feature in
+PubMed. Rejected for v1: PubMed supports many concurrent curation
+sessions because its users are doing literature reviews. Our users
+are doing one-shot cleanups. If we later find that one-shot is
+wrong, multi-named is strictly additive.
+
+**localStorage instead of sessionStorage** — survive tab close.
+Rejected because the user explicitly said "strictly per-session"
+and that matches the PubMed behavior they're used to. The export
+path gives anyone who wants persistence a way to save.
+
+---
+
+### Sequencing inside 5.1.5
+
+Build **5.1.5a first**, then **5.1.5b**, then test the end-to-end
+workflow (search → clipboard → export → prune → re-index → verify).
+Don't skip the dry-run validation at step 4 of the acceptance
+criteria — it's the cheap insurance that guards against subtle
+state-DB corruption bugs.
+
+---
+
 ### 5.1.6 — Fetch optimization (optional sub-task)
 
 **Motivation**: the Gmail Phase 5 first-sync is fetch-bound, not
@@ -822,6 +1144,8 @@ incremental cycle, then benchmark.
 | 4 PST        | 1,2,3 | 4–8 hr | Yes |
 | 5 Gmail      | 1,2,3 | 4–6 hr | Yes |
 | 5.1 Gmail refinements (core: sqlite + skip-if-known + mirror/archive) | 5 | 3–5 hr | Yes |
+| 5.1.5a Curation — `sync.py --prune` CLI | 5.1 core | 2 hr | Yes |
+| 5.1.5b Curation — GUI clipboard + `/api/docs_by_id` | 5.1.5a | 3–4 hr | Yes |
 | 5.1.6 Fetch optimization (benchmark + concurrency) | 5.1 core | 2–6 hr | Yes |
 | 6 Outlook    | 1,2,3 (+separate repo) | 1–2 days | External |
 

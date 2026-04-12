@@ -417,6 +417,104 @@ run with a fresh cursor resumes normal delete handling.
 7. From then on, the cron job runs headlessly. Refresh tokens last
    indefinitely as long as the script runs at least every ~6 months.
 
+## Destructive operations (Phase 5.1.5)
+
+There is exactly one way to permanently remove messages from the
+local Gmail archive: `sync.py --prune FILE`. It reads a list of
+absolute filepaths (one per line; `#` comments and blank lines
+ignored) and, for each path that falls under the configured source
+root, removes three things atomically:
+
+1. The row from `.gmail_state.sqlite`
+2. The `.eml` file on disk
+3. The corresponding entry from `.manifest.json`
+
+What it does NOT touch:
+
+- **Gmail's servers**. The user is expected to have already deleted
+  the messages from Gmail via its web UI. Running `--prune` on
+  messages that are still live in Gmail is recoverable but
+  wasteful: the next incremental sync will re-fetch them from the
+  Gmail history cursor because Gmail still reports them as
+  present.
+- **Solr's index**. The per-source purge pass in `fs_indexer.py`
+  (scoped by `source_name`) removes the Solr doc on the next
+  indexer run when it notices the file is gone.
+
+### Safety features
+
+- **Absolute paths required**. A relative path is rejected with
+  a clear error. This is belt-and-suspenders against the caller
+  being in a different directory than they thought.
+- **Must be under the source root**. Any path that falls outside
+  `FSEARCH_GMAIL_OUTPUT` is rejected before anything is touched —
+  guards against fat-fingered copy-paste sending `rm` at random
+  files on disk.
+- **Dry-run mode** (`--prune-dry-run FILE`) reports exactly what
+  would be removed without touching disk, state DB, or manifest.
+  Recommended for every first use of a new prune list.
+- **Interactive confirmation** for prune lists longer than 10 entries
+  when stdin is a TTY and the file is not stdin (`-`). Skipped in
+  scripted contexts. Override with `--yes`.
+- **Idempotent**. Running `--prune` twice on the same list is a
+  clean no-op the second time — the not-found paths become
+  `skipped`, not errors.
+- **Per-path errors are partial**. Failures on one path don't stop
+  processing the rest. The exit code reflects the worst outcome:
+  0 = all pruned/skipped cleanly, 1 = partial (some rejected or
+  failed), 2 = hard failure (manifest rewrite crashed or similar).
+
+### Why this is a CLI tool and not a GUI button
+
+The workflow is **search → review → curate → act**, and the
+destructive step ("act") is deliberately kept out of the browser:
+
+- **Friction is a feature for destructive actions.** A one-click
+  delete against hundreds of messages is a foot-gun even with
+  confirmation dialogs. Making it a separate CLI invocation
+  forces a pause between "I've selected these" and "I'm actually
+  deleting them."
+- **Auditable via TXT files**. The GUI clipboard exports a text
+  file; the CLI consumes that same text file. The file itself is
+  a durable record of what was destroyed. Dry-running the same
+  file and diffing against the real run gives you a sanity check.
+- **Separates compromised-browser from compromised-host threat
+  models**. A bug in the web UI (XSS, rogue injection, accidental
+  JS loop) can't destroy the archive because the GUI cannot
+  issue destructive commands at all.
+- **Testable in isolation**. The CLI path can be exercised with
+  synthetic prune lists (create a test `.eml` + state DB row +
+  manifest entry, prune it, verify all three locations are
+  clean) without involving Google's API, the browser, or any
+  other moving parts. See the Phase 5.1.5a validation run for
+  an example.
+
+### Why not also delete from Gmail via the API
+
+Tempting, because it collapses the "delete from Gmail via web UI"
+step into the same command. Rejected because:
+
+- Would require re-scoping OAuth from `gmail.readonly` to
+  `gmail.modify`. That's a much broader permission surface and a
+  much scarier test-user consent dialog. The read-only scope
+  means that even a full compromise of the refresh token cannot
+  destroy upstream mail.
+- Gmail's web UI has its own well-understood bulk-operation
+  affordances (select all, undo-for-30-seconds, trash-first
+  semantics). Recreating those in a CLI with equivalent safety is
+  significant effort for marginal convenience.
+- A bug in `--prune` that also destroyed Gmail copies would be
+  irreversible. Keeping the two systems separate means a bad
+  `--prune` only destroys local state, which can be re-fetched
+  via the next sync.
+
+The user-visible ordering is: (1) curate via the GUI clipboard,
+(2) export the TXT file, (3) use that file to drive bulk delete
+in Gmail's web UI, (4) run `sync.py --prune FILE` on the same
+file. Steps 3 and 4 commute — the local prune is safe to do
+first if you prefer, because the next sync will just re-download
+anything you didn't clear on Gmail's side yet.
+
 ## When to throw this away
 
 - Need real-time sync (push notifications) → use Gmail API watch +

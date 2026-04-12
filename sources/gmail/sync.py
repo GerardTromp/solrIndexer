@@ -39,6 +39,7 @@ Special invocation:
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import logging
@@ -656,10 +657,251 @@ def _load_manifest(output_root: Path) -> dict:
         return {}
 
 
+# ── Prune (Phase 5.1.5a: curation hard-delete tool) ────────────────────────
+#
+# Takes a list of filepaths (one per line, absolute paths under the
+# configured output root) and atomically removes each message from the
+# local archive:
+#
+#   1. state DB row (via msg_id looked up from relpath)
+#   2. .eml file on disk
+#   3. manifest entry
+#
+# Does NOT touch Gmail's servers — the user is expected to have already
+# deleted the messages from Gmail via its web UI. If they haven't, the
+# next incremental sync will happily re-download them because Gmail
+# still reports them as present.
+#
+# Does NOT touch Solr — fs_indexer's per-source purge pass (scoped by
+# source_name) handles that on the next indexer run.
+#
+# Source-agnostic philosophy: this function takes a list of paths, not
+# a query. Whatever produced the list (GUI clipboard export, manual
+# editing, CLI pipe from `fsearch`) is outside its scope.
+
+
+def _load_prune_list(source: str) -> list[str]:
+    """
+    Read a list of paths from a file or stdin. `source == "-"` means
+    stdin. Blank lines and lines starting with "#" are ignored. Leading
+    and trailing whitespace on each line is stripped.
+    """
+    if source == "-":
+        lines = sys.stdin.readlines()
+    else:
+        try:
+            with open(source) as f:
+                lines = f.readlines()
+        except OSError as e:
+            log.error(f"Cannot read prune list {source}: {e}")
+            sys.exit(2)
+
+    paths: list[str] = []
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        paths.append(s)
+    return paths
+
+
+def _prune_one(output_root: Path, state_conn: sqlite3.Connection,
+               manifest_entries: dict, raw_path: str,
+               dry_run: bool) -> str:
+    """
+    Process one path from the prune list. Returns one of:
+      "pruned"        — fully removed (state DB + file + manifest)
+      "would_prune"   — dry-run; no changes made
+      "skipped"       — nothing to do (path doesn't exist anywhere)
+      "rejected"      — path outside source root, or some safety check fired
+      "failed"        — unexpected error during removal
+
+    Safety checks:
+      - Rejects paths that aren't under output_root (guards against
+        fat-fingered copy-paste deleting random files)
+      - Rejects non-absolute paths (forces the caller to be explicit)
+    """
+    try:
+        p = Path(raw_path).resolve(strict=False)
+    except (OSError, ValueError) as e:
+        log.warning(f"Rejected (cannot resolve): {raw_path}: {e}")
+        return "rejected"
+
+    # Safety: must be under output_root
+    try:
+        rel = p.relative_to(output_root.resolve())
+    except ValueError:
+        log.warning(
+            f"Rejected (outside source root): {raw_path} "
+            f"(not under {output_root})")
+        return "rejected"
+    rel_posix = rel.as_posix()
+
+    # Look up the state DB row
+    cur = state_conn.execute(
+        "SELECT msg_id FROM fetched WHERE relpath = ?", (rel_posix,))
+    row = cur.fetchone()
+    msg_id = row[0] if row else None
+
+    file_exists = p.exists()
+
+    if msg_id is None and not file_exists:
+        # Nothing to do — neither the DB nor the disk knows about this path
+        log.debug(f"Skipped (no trace on disk or state DB): {rel_posix}")
+        return "skipped"
+
+    if dry_run:
+        parts = []
+        if msg_id:
+            parts.append("state DB row")
+        if file_exists:
+            parts.append(".eml file")
+        if rel_posix in manifest_entries:
+            parts.append("manifest entry")
+        log.info(f"[dry-run] would remove {rel_posix} ({', '.join(parts)})")
+        return "would_prune"
+
+    try:
+        if msg_id is not None:
+            state_conn.execute(
+                "DELETE FROM fetched WHERE msg_id = ?", (msg_id,))
+        if file_exists:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        manifest_entries.pop(rel_posix, None)
+    except (OSError, sqlite3.Error) as e:
+        log.error(f"Failed to prune {rel_posix}: {e}")
+        return "failed"
+
+    return "pruned"
+
+
+def _run_prune(prune_file: str, dry_run: bool, yes: bool) -> int:
+    """
+    Orchestrator for --prune / --prune-dry-run. Returns the exit code
+    that main() should use.
+    """
+    cfg = _load_config()
+    output_root = cfg["output_root"]
+    paths = _load_prune_list(prune_file)
+
+    if not paths:
+        log.warning("Prune list is empty — nothing to do")
+        return 0
+
+    log.info(f"Prune list: {len(paths)} path(s) from "
+             f"{prune_file if prune_file != '-' else '<stdin>'}")
+
+    # Interactive confirmation for >10 paths (unless --yes or reading
+    # from stdin/pipe, where prompting doesn't work anyway).
+    if (not dry_run and not yes and len(paths) > 10
+            and sys.stdin.isatty() and prune_file != "-"):
+        log.warning(
+            f"About to PERMANENTLY remove {len(paths)} message(s) from "
+            f"the local archive under {output_root}.")
+        log.warning("Type 'yes' to proceed, anything else to abort:")
+        ans = input("> ").strip().lower()
+        if ans != "yes":
+            log.info("Aborted by user")
+            return 0
+
+    state_conn = _open_state_db(cfg["state_db_path"])
+    manifest_entries = _load_manifest(output_root)
+
+    counts = {"pruned": 0, "would_prune": 0, "skipped": 0,
+              "rejected": 0, "failed": 0}
+
+    try:
+        for raw_path in paths:
+            result = _prune_one(
+                output_root, state_conn, manifest_entries,
+                raw_path, dry_run)
+            counts[result] = counts.get(result, 0) + 1
+
+        if not dry_run:
+            state_conn.commit()
+    finally:
+        state_conn.close()
+
+    # Rewrite the manifest only if we made real changes. Atomic via
+    # .tmp + rename. If this fails after the per-path removals were
+    # committed, we log loudly and exit nonzero — the individual
+    # removals stay but the manifest is stale. The Phase 3 manifest
+    # reader handles missing-file entries gracefully, so fsearch's
+    # correctness is preserved; only cleanliness suffers.
+    if not dry_run and counts["pruned"] > 0:
+        try:
+            # Rebuild the full manifest dict (preserves version /
+            # source_name / generated_at metadata)
+            manifest = {
+                "version":      1,
+                "source_name":  "gmail",
+                "generated_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "entries":      manifest_entries,
+            }
+            _write_manifest(output_root, manifest)
+        except OSError as e:
+            log.error(
+                f"Manifest rewrite failed after pruning {counts['pruned']} "
+                f"message(s). State DB and disk files are already updated; "
+                f"the manifest may have stale entries. Error: {e}")
+            return 2
+
+    log.info(
+        f"Prune summary: "
+        f"pruned={counts['pruned']} "
+        f"would_prune={counts['would_prune']} "
+        f"skipped={counts['skipped']} "
+        f"rejected={counts['rejected']} "
+        f"failed={counts['failed']}"
+        + (" (DRY-RUN)" if dry_run else "")
+    )
+
+    # Exit codes: 0 on full success, 1 on partial, 2 on hard failure.
+    if counts["failed"] > 0:
+        return 1
+    if counts["rejected"] > 0 and counts["pruned"] == 0 and counts["would_prune"] == 0:
+        return 2
+    if counts["rejected"] > 0:
+        return 1
+    return 0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
+def _parse_argv() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Gmail pull source for fsearch/solrIndexer",
+        epilog="See sources/gmail/DESIGN.md for the full rationale.")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument(
+        "--auth", action="store_true",
+        help="Run the OAuth consent flow interactively (one-time setup)")
+    group.add_argument(
+        "--prune", metavar="FILE",
+        help="Hard-delete a list of messages from the local archive. "
+             "FILE is a text file with one absolute path per line "
+             "(use '-' to read from stdin). Does not touch Gmail or "
+             "Solr — see DESIGN.md 'Destructive operations' section.")
+    group.add_argument(
+        "--prune-dry-run", metavar="FILE", dest="prune_dry_run",
+        help="Like --prune but reports what would be removed without "
+             "touching disk, state DB, or manifest.")
+    p.add_argument(
+        "--yes", action="store_true",
+        help="Skip the interactive confirmation for --prune (>10 paths)")
+    return p.parse_args()
+
+
 def main() -> int:
-    if "--auth" in sys.argv[1:]:
+    args = _parse_argv()
+
+    # --auth is the only sub-command that works without full deps just
+    # to fail cleanly; the sync and prune paths need the Google libs.
+    if args.auth:
         if not _DEPS_OK:
             log.error(f"Google API libraries missing: {_DEPS_ERR}\n"
                       f"  pip install google-api-python-client google-auth-oauthlib")
@@ -668,6 +910,15 @@ def main() -> int:
         _ensure_creds(cfg, interactive=True)
         return 0
 
+    if args.prune or args.prune_dry_run:
+        # Prune doesn't need Google API libs — it's a local state
+        # operation. But we still need the other stdlib imports we
+        # already have.
+        prune_file = args.prune or args.prune_dry_run
+        return _run_prune(prune_file, dry_run=bool(args.prune_dry_run),
+                          yes=args.yes)
+
+    # Default path: sync
     if not _DEPS_OK:
         log.error(f"Google API libraries missing: {_DEPS_ERR}\n"
                   f"  pip install google-api-python-client google-auth-oauthlib")

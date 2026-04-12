@@ -270,6 +270,78 @@ short version: when things go wrong, the worst outcome of mirror
 mode (missing local data) is much worse than the worst outcome of
 archive mode (stale local data).
 
+## Pruning messages from the local archive
+
+Because the default is archive mode, Gmail deletes don't automatically
+remove local copies. When you want to reclaim space or remove content
+that's no longer needed, use `sync.py --prune`.
+
+### Workflow
+
+1. **Find** the messages to delete using `fsearch` (CLI or web GUI).
+2. **Review** the hits to make sure they're actually what you want gone.
+3. **Collect** the filepaths into a text file, one path per line.
+   You can do this by hand (copy-paste from the web GUI's "copy path"
+   row button) or — once Phase 5.1.5b ships — via the GUI curation
+   clipboard's "Export TXT" action.
+4. **Delete from Gmail** via the web UI. This is optional but
+   recommended; otherwise the next incremental sync will re-download
+   anything you pruned locally that's still present on Gmail.
+5. **Dry-run the prune** first to sanity-check:
+   ```bash
+   /opt/fsearch/sources/gmail/sync.py --prune-dry-run /path/to/list.txt
+   ```
+6. **Run the real prune** when the dry-run output looks right:
+   ```bash
+   /opt/fsearch/sources/gmail/sync.py --prune /path/to/list.txt
+   ```
+7. **Re-index** so Solr's docs for the pruned messages get removed:
+   ```bash
+   fs_indexer.py --source gmail
+   ```
+   (Or just wait for the nightly cron.)
+
+### Example: clean out old newsletter subscriptions
+
+```bash
+# Find them
+fsearch -q 'source_name:gmail AND source_metadata:"newsletter" AND source_timestamp:[* TO 2020-01-01T00:00:00Z]' \
+    --sort 'source_timestamp asc' -l 500 -Q > old_newsletters.txt
+
+# Sanity check the count
+wc -l old_newsletters.txt
+
+# Dry-run
+/opt/fsearch/sources/gmail/sync.py --prune-dry-run old_newsletters.txt
+
+# ... delete from Gmail via web UI ...
+
+# Actually prune
+/opt/fsearch/sources/gmail/sync.py --prune old_newsletters.txt
+
+# Reconcile Solr
+fs_indexer.py --source gmail
+```
+
+### Safety features
+
+- **Absolute paths only**. Relative paths are rejected.
+- **Paths must be under the Gmail source root**. Anything else is
+  rejected before any disk operation. This guards against a typo or
+  wrong-file paste destroying random files.
+- **Interactive confirmation** for lists over 10 entries (skipped
+  with `--yes` or when reading from stdin / a pipe).
+- **Idempotent**. Running the same list twice is a clean no-op the
+  second time.
+- **Exit codes**: 0 clean, 1 partial (some rejections or failures),
+  2 hard failure.
+- **The prune is local-only** — does NOT touch Gmail's servers or
+  Solr. Solr reconciles on the next indexer run via its existing
+  per-source purge pass. Gmail stays in whatever state you left it.
+
+See `sources/gmail/DESIGN.md` "Destructive operations" section for
+the full rationale and threat-model discussion.
+
 ## Troubleshooting
 
 **"Google API libraries missing"**  
