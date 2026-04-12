@@ -289,6 +289,161 @@ kbd {
   padding: 1px 5px;
   font-size: 11px;
 }
+
+/* ── Curation clipboard (Phase 5.1.5b) ─────────────────────────────────── */
+td.check-cell, th.check-cell {
+  width: 24px;
+  padding: 4px 4px 4px 8px;
+  text-align: center;
+  vertical-align: top;
+}
+td.check-cell input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+td.check-cell .in-clipboard {
+  color: var(--accent2);
+  font-weight: bold;
+  cursor: help;
+  font-size: 13px;
+}
+.clipboard-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg);
+  color: var(--accent2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  margin-left: auto;
+}
+.clipboard-badge:hover {
+  border-color: var(--accent2);
+  color: var(--accent);
+}
+.clipboard-badge.empty {
+  color: var(--text-dim);
+  cursor: default;
+}
+.clipboard-badge.empty:hover {
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+.btn-send {
+  background: var(--accent2);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn-send:not(:disabled):hover { opacity: 0.9; }
+
+/* Modal overlay + content */
+.modal-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 1000;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 40px 20px;
+  overflow-y: auto;
+}
+.modal-backdrop.visible { display: flex; }
+.modal-content {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-width: 1200px;
+  width: 100%;
+  max-height: calc(100vh - 80px);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.modal-header h2 {
+  font-size: 15px;
+  color: var(--accent2);
+  font-weight: 600;
+  margin: 0;
+}
+.modal-header .modal-actions { margin-left: auto; display: flex; gap: 6px; }
+.modal-header .modal-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 8px;
+  line-height: 1;
+}
+.modal-header .modal-close:hover { color: var(--red); }
+.modal-body {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+.modal-body table.clipboard-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.modal-body table.clipboard-table th {
+  text-align: left;
+  padding: 6px 10px;
+  color: var(--accent);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+.modal-body table.clipboard-table td {
+  padding: 4px 10px;
+  border-bottom: 1px solid #2a2e42;
+  vertical-align: top;
+}
+.modal-body .path-cell { color: var(--green); word-break: break-all; }
+.modal-body .ext-cell { color: var(--orange); white-space: nowrap; }
+.modal-body .size-cell { text-align: right; white-space: nowrap; color: var(--cyan); }
+.modal-body .date-cell { white-space: nowrap; }
+.modal-body .remove-cell { width: 24px; text-align: center; }
+.modal-body .remove-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.modal-body .remove-btn:hover { color: var(--red); border-color: var(--border); }
+.modal-body .empty-msg {
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 20px;
+  text-align: center;
+}
 </style>
 </head>
 <body>
@@ -309,6 +464,9 @@ kbd {
             title="Download filtered list as CSV (all columns)">Export CSV</button>
     <button class="btn btn-secondary" onclick="doExport('txt')"
             title="Download filtered list as TXT (filepath only)">Export TXT</button>
+    <button class="btn-send" id="btn-send-to-clipboard" disabled
+            onclick="sendCheckedToClipboard()"
+            title="Add the checked results to the curation clipboard (session-scoped)">Send to clipboard (0)</button>
     <label title="Max rows to export (capped server-side at 100000)">Export max
       <input type="number" id="export-limit" value="10000" min="1" max="100000" style="width:80px">
     </label>
@@ -326,9 +484,32 @@ kbd {
         <option value="filename asc">Filename A-Z</option>
       </select>
     </label>
-    <label style="margin-left:auto">
+    <a href="#" class="clipboard-badge empty" id="clipboard-badge"
+       onclick="openClipboardModal(event)"
+       title="Open curation clipboard">&#x1F4CB; <span id="clipboard-count">0</span></a>
+    <label>
       <input type="checkbox" id="highlight" checked> Highlight
     </label>
+  </div>
+</div>
+
+<!-- Curation clipboard modal (Phase 5.1.5b) -->
+<div class="modal-backdrop" id="clipboard-modal" onclick="closeClipboardModal(event)">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2>&#x1F4CB; Curation clipboard <span id="clipboard-modal-count" style="color:var(--text-dim); font-weight:400"></span></h2>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="exportClipboard('csv')">Export CSV</button>
+        <button class="btn btn-secondary" onclick="exportClipboard('txt')">Export TXT</button>
+        <button class="btn btn-secondary" onclick="exportClipboard('json')">Export JSON</button>
+        <button class="btn btn-secondary" onclick="clearClipboard()"
+                title="Empty the clipboard (session-scoped, cannot be undone)">Clear all</button>
+      </div>
+      <button class="modal-close" onclick="closeClipboardModal()" title="Close">&times;</button>
+    </div>
+    <div class="modal-body" id="clipboard-modal-body">
+      <div class="empty-msg">Loading&hellip;</div>
+    </div>
   </div>
 </div>
 
@@ -362,6 +543,82 @@ kbd {
 let rowId = 0;
 let expandedPath = null;   // filepath of currently expanded content row
 let lastQuery = "";        // last generated Solr query
+
+// ── Curation clipboard (Phase 5.1.5b) ───────────────────────────────────────
+// Session-scoped clipboard of Solr document IDs (= filepaths), mirroring
+// the PubMed clipboard pattern. Storage is sessionStorage — dies with the
+// tab. Persists only the id list, not cached metadata; the clipboard modal
+// hydrates fresh from /api/docs_by_id when opened, so any re-indexed doc
+// shows its latest state.
+const CLIPBOARD_KEY = "fsearch.clipboard.v1";
+
+function clipboardLoad() {
+  try {
+    const raw = sessionStorage.getItem(CLIPBOARD_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    console.warn("Clipboard load failed:", e);
+    return [];
+  }
+}
+
+function clipboardSave(ids) {
+  try {
+    sessionStorage.setItem(CLIPBOARD_KEY, JSON.stringify(ids));
+  } catch (e) {
+    console.error("Clipboard save failed:", e);
+    flashStatus("Clipboard save failed: " + e.message);
+    return;
+  }
+  window.dispatchEvent(new CustomEvent("clipboardchange"));
+}
+
+function clipboardHas(id) {
+  return clipboardLoad().includes(id);
+}
+
+function clipboardSize() {
+  return clipboardLoad().length;
+}
+
+function clipboardAdd(ids) {
+  const current = clipboardLoad();
+  const seen = new Set(current);
+  let added = 0;
+  for (const id of ids) {
+    if (id && !seen.has(id)) {
+      current.push(id);
+      seen.add(id);
+      added++;
+    }
+  }
+  if (added > 0) clipboardSave(current);
+  return added;
+}
+
+function clipboardRemove(id) {
+  const current = clipboardLoad();
+  const next = current.filter(x => x !== id);
+  if (next.length !== current.length) clipboardSave(next);
+}
+
+function clipboardClearAll() {
+  clipboardSave([]);
+}
+
+function updateClipboardBadge() {
+  const n = clipboardSize();
+  const badge = document.getElementById("clipboard-badge");
+  const countEl = document.getElementById("clipboard-count");
+  if (!badge || !countEl) return;
+  countEl.textContent = String(n);
+  badge.classList.toggle("empty", n === 0);
+}
+
+// Listen for any change to the clipboard and refresh the badge
+window.addEventListener("clipboardchange", updateClipboardBadge);
 
 const FIELDS = [
   { value: "text",    label: "Text"    },
@@ -561,6 +818,10 @@ async function doSearch() {
       ` &mdash; <span class="query-text">${escHtml(data.query)}</span>` +
       ` <button class="btn-icon" onclick="copyQuery()" title="Copy query for fsearch -q">&#x2398;</button>` +
       ` <button class="btn-icon" onclick="copyCli()" title="Copy full fsearch command">cli</button>`;
+    // Cache so the clipboard flow can trigger a re-render without
+    // re-querying Solr (only the main results page — clipboard modal
+    // always re-hydrates via /api/docs_by_id).
+    window._lastDocs = data.docs;
     renderResults(data.docs);
 
   } catch (e) {
@@ -637,7 +898,10 @@ function renderResults(docs) {
 
   let html = `<table class="results">
     <thead><tr>
-      <th style="width:55%">Path</th>
+      <th class="check-cell"><input type="checkbox" id="check-all-results"
+          title="Select/deselect all on this page"
+          onclick="toggleAllChecks(this)"></th>
+      <th style="width:53%">Path</th>
       <th style="width:7%">Ext</th>
       <th style="width:12%">Size</th>
       <th style="width:12%">Modified</th>
@@ -650,6 +914,7 @@ function renderResults(docs) {
     const mt      = fmtDate(doc.mtime);
     const hl      = doc.highlights || {};
     const preview = doc.content_preview || "";
+    const inClip  = clipboardHas(fp);
 
     // Main result row. Path is carried via data-filepath (set after insert
     // via textContent to avoid HTML-escaping pitfalls); action buttons are
@@ -661,7 +926,15 @@ function renderResults(docs) {
       <button class="btn-icon" data-action="folder" title="Copy folder path">&#x1F4C1;</button>
       ${hasHash ? `<button class="btn-icon" data-action="dupes" title="Find duplicates of this file">&#x29C9;</button>` : ""}
     </span>`;
+    // Checkbox cell: show a pending-selection checkbox, OR the
+    // "already in clipboard" indicator. Pending-selection click must
+    // stopPropagation so it doesn't also toggle the row expansion.
+    const checkCell = inClip
+      ? `<td class="check-cell"><span class="in-clipboard" title="In clipboard">&#x2713;</span></td>`
+      : `<td class="check-cell"><input type="checkbox" class="result-check"
+            onclick="event.stopPropagation(); updateSendButton()"></td>`;
     html += `<tr class="result-row" data-idx="${idx}" onclick="toggleContent(this)">
+      ${checkCell}
       <td class="path-cell"><span class="path-text">${escHtml(fp)}</span>${actions}</td>
       <td class="ext-cell">${escHtml(ext)}</td>
       <td class="size-cell">${sz}</td>
@@ -672,13 +945,13 @@ function renderResults(docs) {
     for (const [field, snips] of Object.entries(hl)) {
       for (const snip of snips) {
         // snip already has <mark> tags from Solr — safe to inject
-        html += `<tr class="snippet-row"><td colspan="4">${snip}</td></tr>`;
+        html += `<tr class="snippet-row"><td colspan="5">${snip}</td></tr>`;
       }
     }
 
     // Content preview (hidden until clicked) — data already in hand, no API call needed
     html += `<tr class="content-row" id="content-${idx}" style="display:none">
-      <td colspan="4">
+      <td colspan="5">
         <div class="content-panel">${preview ? escHtml(preview) : "(no content extracted)"}</div>
       </td>
     </tr>`;
@@ -699,6 +972,7 @@ function renderResults(docs) {
   area.querySelectorAll(".row-actions .btn-icon").forEach(btn => {
     btn.addEventListener("click", handleRowAction);
   });
+  updateSendButton();
 }
 
 function handleRowAction(ev) {
@@ -728,6 +1002,214 @@ async function findDuplicates(hash) {
   row.querySelector(".field-select").value = "raw";
   row.querySelector(".value-input").value  = `content_sha256:"${hash}"`;
   doSearch();
+}
+
+// ── Clipboard UI ────────────────────────────────────────────────────────────
+
+function toggleAllChecks(headerBox) {
+  const boxes = document.querySelectorAll("#results-area .result-check");
+  boxes.forEach(b => { b.checked = headerBox.checked; });
+  updateSendButton();
+}
+
+function updateSendButton() {
+  const btn = document.getElementById("btn-send-to-clipboard");
+  if (!btn) return;
+  const boxes = document.querySelectorAll("#results-area .result-check:checked");
+  const n = boxes.length;
+  btn.disabled = n === 0;
+  btn.textContent = `Send to clipboard (${n})`;
+}
+
+function sendCheckedToClipboard() {
+  const boxes = document.querySelectorAll("#results-area .result-check:checked");
+  if (!boxes.length) return;
+  const ids = [];
+  boxes.forEach(box => {
+    const tr = box.closest("tr.result-row");
+    if (tr && tr._filepath) ids.push(tr._filepath);
+  });
+  const added = clipboardAdd(ids);
+
+  // Re-render the current results so the checked rows become "In
+  // clipboard" indicators (clearing the checkbox UI state at the
+  // same time, since the model is now authoritative for those ids).
+  if (window._lastDocs) {
+    renderResults(window._lastDocs);
+  } else {
+    // Fallback: just clear the checkboxes
+    boxes.forEach(b => { b.checked = false; });
+    updateSendButton();
+  }
+  flashStatus(`Added ${added} to clipboard (${clipboardSize()} total)`);
+}
+
+async function openClipboardModal(ev) {
+  if (ev) ev.preventDefault();
+  const ids = clipboardLoad();
+  const modal = document.getElementById("clipboard-modal");
+  const body = document.getElementById("clipboard-modal-body");
+  const countSpan = document.getElementById("clipboard-modal-count");
+  modal.classList.add("visible");
+
+  if (ids.length === 0) {
+    countSpan.textContent = "(empty)";
+    body.innerHTML = `<div class="empty-msg">Clipboard is empty. Check some results in the table and click "Send to clipboard".</div>`;
+    return;
+  }
+
+  countSpan.textContent = `(${ids.length} item${ids.length === 1 ? "" : "s"})`;
+  body.innerHTML = `<div class="empty-msg">Loading ${ids.length} docs\u2026</div>`;
+
+  try {
+    const resp = await fetch("/api/docs_by_id", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ids}),
+    });
+    if (!resp.ok) {
+      body.innerHTML = `<div class="empty-msg" style="color:var(--red)">HTTP ${resp.status} loading clipboard</div>`;
+      return;
+    }
+    const data = await resp.json();
+    if (data.error) {
+      body.innerHTML = `<div class="empty-msg" style="color:var(--red)">${escHtml(data.error)}</div>`;
+      return;
+    }
+    renderClipboardTable(data.docs || []);
+  } catch (e) {
+    body.innerHTML = `<div class="empty-msg" style="color:var(--red)">Error: ${escHtml(e.message)}</div>`;
+  }
+}
+
+function closeClipboardModal(ev) {
+  // Two entry points: backdrop click (ev exists, target === currentTarget
+  // because modal-content stopPropagations its own clicks) and close-button
+  // click (ev exists but comes from the button directly — always closes).
+  // Called with no argument programmatically — also always closes.
+  if (ev && ev.currentTarget && ev.target !== ev.currentTarget) {
+    // Backdrop click where bubbling came from inside modal-content.
+    // The stopPropagation on modal-content should prevent this, but
+    // be defensive.
+    return;
+  }
+  document.getElementById("clipboard-modal").classList.remove("visible");
+}
+
+function renderClipboardTable(docs) {
+  const body = document.getElementById("clipboard-modal-body");
+  if (!docs.length) {
+    body.innerHTML = `<div class="empty-msg">All clipboard items disappeared since you added them.</div>`;
+    return;
+  }
+
+  // Cache the docs for client-side export
+  window._clipboardDocs = docs;
+
+  let html = `<table class="clipboard-table">
+    <thead><tr>
+      <th>Path</th>
+      <th>Ext</th>
+      <th>Size</th>
+      <th>Modified</th>
+      <th class="remove-cell"></th>
+    </tr></thead><tbody>`;
+
+  docs.forEach((doc, i) => {
+    const fp  = doc.filepath || "";
+    const ext = doc.extension || "";
+    const sz  = fmtSize(doc.size_bytes);
+    const mt  = fmtDate(doc.mtime);
+    html += `<tr data-idx="${i}">
+      <td class="path-cell">${escHtml(fp)}</td>
+      <td class="ext-cell">${escHtml(ext)}</td>
+      <td class="size-cell">${sz}</td>
+      <td class="date-cell">${mt}</td>
+      <td class="remove-cell">
+        <button class="remove-btn" data-fp="" title="Remove from clipboard">&times;</button>
+      </td>
+    </tr>`;
+  });
+  html += `</tbody></table>`;
+  body.innerHTML = html;
+
+  // Wire remove buttons via property (avoid HTML escaping for paths)
+  body.querySelectorAll(".remove-btn").forEach((btn, i) => {
+    btn._filepath = docs[i].filepath || "";
+    btn.addEventListener("click", () => removeFromClipboard(btn._filepath));
+  });
+}
+
+function removeFromClipboard(fp) {
+  if (!fp) return;
+  clipboardRemove(fp);
+  // Re-open the modal to refresh its contents
+  openClipboardModal();
+  // Also re-render the main results to flip any corresponding row
+  // back to a pending-selection checkbox
+  if (window._lastDocs) renderResults(window._lastDocs);
+  flashStatus(`Removed from clipboard (${clipboardSize()} remain)`);
+}
+
+function clearClipboard() {
+  const n = clipboardSize();
+  if (n === 0) return;
+  if (!confirm(`Clear ${n} item${n === 1 ? "" : "s"} from the clipboard? This cannot be undone.`)) {
+    return;
+  }
+  clipboardClearAll();
+  openClipboardModal();
+  if (window._lastDocs) renderResults(window._lastDocs);
+  flashStatus("Clipboard cleared");
+}
+
+function exportClipboard(format) {
+  const docs = window._clipboardDocs || [];
+  if (!docs.length) {
+    flashStatus("Nothing in clipboard to export");
+    return;
+  }
+
+  const ts = new Date().toISOString().replace(/[-:T]/g, "").substring(0, 15);
+  const filename = `fsearch_clipboard_${ts}.${format}`;
+  let blob;
+
+  if (format === "txt") {
+    const text = docs.map(d => d.filepath || "").filter(Boolean).join("\n") + "\n";
+    blob = new Blob([text], {type: "text/plain;charset=utf-8"});
+  } else if (format === "json") {
+    blob = new Blob([JSON.stringify(docs, null, 2)], {type: "application/json"});
+  } else if (format === "csv") {
+    const cols = ["filepath", "filename", "extension", "size_bytes",
+                  "mtime", "directory", "content_sha256",
+                  "language", "mimetype_detected",
+                  "source_name", "source_kind", "source_timestamp"];
+    const lines = [cols.join(",")];
+    const csvEscape = v => {
+      if (v == null) return "";
+      if (Array.isArray(v)) v = v[0] || "";
+      const s = String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    for (const doc of docs) {
+      lines.push(cols.map(c => csvEscape(doc[c])).join(","));
+    }
+    blob = new Blob([lines.join("\n") + "\n"], {type: "text/csv;charset=utf-8"});
+  } else {
+    flashStatus("Unknown format: " + format);
+    return;
+  }
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+
+  flashStatus(`Downloaded ${filename} (${fmtSize(blob.size)})`);
 }
 
 // ── Content preview toggle ──────────────────────────────────────────────────
@@ -861,6 +1343,7 @@ document.addEventListener("keydown", (e) => {
 
 // ── Init ────────────────────────────────────────────────────────────────────
 addRow("text");
+updateClipboardBadge();
 </script>
 
 </body>

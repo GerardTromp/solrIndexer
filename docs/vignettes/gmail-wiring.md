@@ -281,9 +281,8 @@ that's no longer needed, use `sync.py --prune`.
 1. **Find** the messages to delete using `fsearch` (CLI or web GUI).
 2. **Review** the hits to make sure they're actually what you want gone.
 3. **Collect** the filepaths into a text file, one path per line.
-   You can do this by hand (copy-paste from the web GUI's "copy path"
-   row button) or — once Phase 5.1.5b ships — via the GUI curation
-   clipboard's "Export TXT" action.
+   Either copy-paste from the web GUI's "copy path" row button, or
+   use the GUI curation clipboard described below.
 4. **Delete from Gmail** via the web UI. This is optional but
    recommended; otherwise the next incremental sync will re-download
    anything you pruned locally that's still present on Gmail.
@@ -341,6 +340,61 @@ fs_indexer.py --source gmail
 
 See `sources/gmail/DESIGN.md` "Destructive operations" section for
 the full rationale and threat-model discussion.
+
+## Curation clipboard (web GUI)
+
+The web GUI has a PubMed-style curation clipboard that collects
+messages across multiple searches. The clipboard is per-browser-tab
+(session-scoped) and lives entirely in the browser — nothing is
+saved to disk until you explicitly export.
+
+### Typical session
+
+1. **Search** by keywords, sender, date range, etc. Standard Boolean
+   rows in the search form.
+2. **Review** the hits. Click any row to expand the content preview.
+3. **Check** the box on the far left of each row you want to act on.
+4. **Click "Send to clipboard (N)"** in the controls bar — the
+   checked rows move into the clipboard and their row indicators
+   flip to "✓ In clipboard".
+5. **Refine your query or start a new one**, repeat steps 2-4. The
+   clipboard accumulates across searches; rows you've already added
+   show up with the "✓" indicator so you don't re-add duplicates.
+6. **Open the clipboard** by clicking the 📋 badge in the top-right
+   of the controls bar. A modal shows everything you've collected
+   with full metadata (path, ext, size, modified).
+7. **Review and refine**: click ✕ next to any row to remove that
+   item from the clipboard. "Clear all" empties it entirely.
+8. **Export** as TXT (one path per line, the format `sync.py --prune`
+   consumes), CSV (all metadata columns), or JSON (full doc dicts).
+   Filename format: `fsearch_clipboard_YYYYMMDDTHHMMSS.<ext>`.
+
+### What the clipboard is NOT
+
+- **NOT persistent across tabs or reloads**: `sessionStorage` dies
+  with the tab. This is deliberate — it matches the PubMed pattern
+  and forces you to explicitly export anything you want to keep.
+- **NOT a delete button**: the clipboard is read-only curation.
+  Actually destroying data still requires running `sync.py --prune`
+  at the command line against the exported TXT file. Friction is a
+  feature for destructive operations.
+- **NOT a saved search**: it stores specific document IDs, not a
+  query. If you re-index and a file's ID changes (it doesn't under
+  the current schema, but hypothetically), the clipboard item
+  becomes a dead reference.
+
+### Tips
+
+- The "select all on this page" checkbox in the table header is
+  scoped to the currently-visible results only. Paginating with
+  different Limit / Sort values does NOT clear the clipboard — it
+  only clears pending selections that haven't been sent yet.
+- To check how many items you've collected without opening the
+  modal, just look at the 📋 badge — it updates live.
+- If the server-side index changes between the clipboard being
+  populated and the clipboard being opened (e.g., a prune or full
+  re-index happens), the modal shows whatever of the listed IDs
+  still exist in Solr. Missing IDs are silently dropped.
 
 ## Troubleshooting
 

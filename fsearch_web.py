@@ -221,6 +221,60 @@ def api_search():
     })
 
 
+@app.route("/api/docs_by_id", methods=["POST"])
+def api_docs_by_id():
+    """
+    Fetch docs for a specific list of Solr ids (= filepaths).
+
+    Used by the Phase 5.1.5b GUI curation clipboard to hydrate the
+    clipboard modal from the list of IDs stored in sessionStorage.
+
+    Request body:
+        {"ids": ["/path/a.eml", "/path/b.eml", ...]}
+
+    Returns docs in the same shape as /api/search, minus highlights
+    (which are query-dependent and not meaningful here).
+
+    Solr {!terms} parser is used because it handles thousands of
+    values per query without hitting the 1024 Boolean-clause limit
+    that q=id:(a OR b OR ...) would blow through. We still batch at
+    a conservative ceiling to keep individual query bodies small.
+    """
+    body = request.get_json(force=True)
+    ids = body.get("ids") or []
+    if not isinstance(ids, list):
+        return jsonify({"error": "ids must be a list"}), 400
+    ids = [str(i) for i in ids if i]
+    if not ids:
+        return jsonify({"total": 0, "docs": []})
+
+    solr = pysolr.Solr(body.get("solr_url", SOLR_URL), timeout=30)
+
+    fl = ("filepath,filename,size_bytes,mtime,extension,directory,"
+          "content_preview,content_sha256,language,mimetype_detected,"
+          "source_name,source_kind,source_timestamp,source_metadata")
+
+    # {!terms f=id} supports tens of thousands of values but individual
+    # HTTP request bodies grow — batch at 500 for safety.
+    BATCH = 500
+    docs: list[dict] = []
+    try:
+        for i in range(0, len(ids), BATCH):
+            chunk = ids[i:i + BATCH]
+            # Solr's {!terms} parser expects comma-separated values.
+            # Ids in our schema are filepaths, which may contain commas.
+            # Use a separator that can't appear in a filesystem path: \0.
+            # {!terms f=id separator='\0'} is valid Solr syntax.
+            q = "{!terms f=id separator=\"\\u0000\"}" + "\u0000".join(chunk)
+            results = solr.search(q, fl=fl, rows=len(chunk))
+            for doc in results:
+                docs.append(dict(doc))
+    except pysolr.SolrError as e:
+        return jsonify({"error": f"Solr error: {e}"}), 502
+
+    return jsonify({"total": len(docs), "docs": docs})
+
+
 @app.route("/api/export", methods=["POST"])
 def api_export():
     """
