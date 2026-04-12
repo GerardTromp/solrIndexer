@@ -27,6 +27,12 @@ Environment variables (all required for normal runs):
                              deletes by removing the corresponding .eml
                              file locally. Default is archive mode: local
                              files survive upstream deletes. See DESIGN.md.
+  FSEARCH_GMAIL_CONCURRENCY  "threads" (default) or "serial". Phase 5.1.6
+                             measured 4.8x speedup for threads with zero
+                             rate-limit errors against a random 200-msg
+                             sample. Set to "serial" as an escape hatch
+                             if quota issues arise.
+  FSEARCH_GMAIL_THREADS      Worker count when concurrency=threads [5].
   FSEARCH_GMAIL_LOG_LEVEL    DEBUG | INFO | WARNING (default INFO)
 
 One-time setup: see DESIGN.md "Setup checklist" section.
@@ -47,7 +53,9 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.parser import BytesHeaderParser
 from email.utils import parsedate_to_datetime
@@ -90,6 +98,17 @@ EXCLUDED_LABELS = {"DRAFT", "CHAT", "SPAM", "TRASH"}
 # Env-var truthy values for FSEARCH_GMAIL_MIRROR
 _TRUTHY = {"1", "true", "yes", "on"}
 
+# Default concurrency mode (Phase 5.1.6). Override with
+# FSEARCH_GMAIL_CONCURRENCY=serial or =threads.
+DEFAULT_CONCURRENCY = "threads"
+DEFAULT_THREAD_WORKERS = 5
+
+# Response fields we need on every messages.get. Matches what the
+# production code actually consumes. Using `fields` masks saves ~30%
+# response bandwidth per call vs. the default (which includes snippet,
+# payload parts, size estimates, etc. that we decode-and-discard).
+GET_FIELDS = "raw,internalDate,labelIds,threadId"
+
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -120,18 +139,33 @@ def _load_config() -> dict:
     # causal-chain rationale.
     mirror_mode = os.environ.get("FSEARCH_GMAIL_MIRROR", "").lower() in _TRUTHY
 
+    # Phase 5.1.6: concurrency mode. Threads-5 measured 4.8x faster
+    # than serial with zero rate-limit errors in benchmark_fetch.py.
+    concurrency = os.environ.get("FSEARCH_GMAIL_CONCURRENCY", DEFAULT_CONCURRENCY).lower()
+    if concurrency not in ("serial", "threads"):
+        log.warning(f"Unknown FSEARCH_GMAIL_CONCURRENCY={concurrency!r}, "
+                    f"defaulting to {DEFAULT_CONCURRENCY}")
+        concurrency = DEFAULT_CONCURRENCY
+    try:
+        thread_workers = int(os.environ.get(
+            "FSEARCH_GMAIL_THREADS", DEFAULT_THREAD_WORKERS))
+    except ValueError:
+        thread_workers = DEFAULT_THREAD_WORKERS
+
     output_root.mkdir(parents=True, exist_ok=True)
     if not os.access(output_root, os.W_OK):
         log.error(f"Output dir not writable: {output_root}")
         sys.exit(2)
 
     return {
-        "output_root":   output_root,
-        "creds_path":    creds_path,
-        "token_path":    token_path,
-        "state_path":    state_path,
-        "state_db_path": state_db_path,
-        "mirror_mode":   mirror_mode,
+        "output_root":    output_root,
+        "creds_path":     creds_path,
+        "token_path":     token_path,
+        "state_path":     state_path,
+        "state_db_path":  state_db_path,
+        "mirror_mode":    mirror_mode,
+        "concurrency":    concurrency,
+        "thread_workers": thread_workers,
     }
 
 
@@ -460,67 +494,91 @@ def _list_history_changes(service, start_id: str
     return added, deleted, latest_history_id
 
 
+# Phase 5.1.6: the fetch+write code path is split from the state DB
+# write so the worker (_fetch_only) is purely thread-safe — it never
+# touches sqlite and only writes an .eml file at a path derived from
+# the msg_id, so concurrent callers never collide on output paths.
+# The main thread consumes the returned tuples and records them to
+# sqlite sequentially.
+
+def _fetch_only(service, msg_id: str, output_root: Path
+                ) -> tuple[str, str, int, dict | None] | None:
+    """
+    Fetch one message, decode, write the .eml, and return a tuple of
+    (msg_id, relpath, internal_ms, manifest_entry_dict_or_None).
+
+    Thread-safe: no sqlite, no shared mutable state. Each worker
+    thread must have its own `service` (httplib2 is not thread-safe
+    on a shared http object).
+
+    Returns None on any failure (network, decode, filesystem).
+    """
+    try:
+        msg = service.users().messages().get(
+            userId="me", id=msg_id, format="raw",
+            fields=GET_FIELDS).execute()
+    except HttpError as e:
+        log.debug(f"Fetch failed for {msg_id}: {e}")
+        return None
+
+    raw = msg.get("raw", "")
+    if not raw:
+        return None
+    try:
+        eml_bytes = base64.urlsafe_b64decode(raw.encode("ascii"))
+    except Exception as e:
+        log.debug(f"Base64 decode failed for {msg_id}: {e}")
+        return None
+
+    internal_date_ms = int(msg.get("internalDate", "0") or "0")
+    eml_path = _eml_path_for(output_root, internal_date_ms, msg_id)
+    try:
+        eml_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = eml_path.with_suffix(eml_path.suffix + ".tmp")
+        tmp.write_bytes(eml_bytes)
+        tmp.replace(eml_path)
+    except OSError as e:
+        log.warning(f"Disk write failed for {msg_id}: {e}")
+        return None
+
+    # Manifest enrichment: parse only the headers (cheap), and pull
+    # Gmail-specific labels/threadId from the API response.
+    entry = _build_manifest_entry(eml_bytes, msg, eml_path, output_root)
+    try:
+        relpath = eml_path.resolve().relative_to(
+            output_root.resolve()).as_posix()
+    except (ValueError, OSError):
+        relpath = str(eml_path)
+    return (msg_id, relpath, internal_date_ms, entry)
+
+
 def _fetch_and_save(service, msg_id: str, output_root: Path,
                     manifest_entries: dict,
                     state_conn: sqlite3.Connection) -> str:
     """
-    Fetch one message in raw form, base64url-decode it, write the .eml,
-    append a manifest entry, and record the fetch in the state DB.
+    Serial-mode convenience wrapper around _fetch_only. Handles the
+    skip-if-known check, calls the worker, and records the result to
+    the state DB + manifest if it succeeded.
 
     Returns one of:
       "fetched"  — new API fetch succeeded, file + DB row written
       "skipped"  — already in state DB, no API call made
       "failed"   — any error, including transient API failures
-
-    The Phase-5 predecessor returned a bool (True/False); the three-way
-    result lets main() distinguish "skipped for free" from "actually
-    worked" for accurate reporting.
     """
     # Skip-if-known check — Phase 5.1 core value. For a 26k-message
     # mailbox this turns a ~4h foreground recovery into a ~5s no-op.
     if _is_known(state_conn, msg_id):
         return "skipped"
 
-    try:
-        msg = service.users().messages().get(
-            userId="me", id=msg_id, format="raw").execute()
-    except HttpError as e:
-        log.debug(f"Fetch failed for {msg_id}: {e}")
+    result = _fetch_only(service, msg_id, output_root)
+    if result is None:
         return "failed"
 
-    raw = msg.get("raw", "")
-    if not raw:
-        return "failed"
-    try:
-        eml_bytes = base64.urlsafe_b64decode(raw.encode("ascii"))
-    except Exception as e:
-        log.debug(f"Base64 decode failed for {msg_id}: {e}")
-        return "failed"
-
-    internal_date_ms = int(msg.get("internalDate", "0") or "0")
-    eml_path = _eml_path_for(output_root, internal_date_ms, msg_id)
-    eml_path.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp = eml_path.with_suffix(eml_path.suffix + ".tmp")
-    tmp.write_bytes(eml_bytes)
-    tmp.replace(eml_path)
-
-    # Manifest enrichment: parse only the headers (cheap), and pull
-    # Gmail-specific labels/threadId from the API response.
-    entry = _build_manifest_entry(eml_bytes, msg, eml_path, output_root)
-    relpath = ""
-    if entry:
-        try:
-            relpath = eml_path.resolve().relative_to(
-                output_root.resolve()).as_posix()
-            manifest_entries[relpath] = entry
-        except (ValueError, OSError):
-            pass
-
-    # Record the fetch in the state DB. This is what makes skip-if-known
-    # work on the next run. Commit happens in batches in main() to avoid
-    # one fsync per message.
-    _record_fetched(state_conn, msg_id, relpath, internal_date_ms)
+    _mid, relpath, internal_ms, entry = result
+    if entry is not None:
+        manifest_entries[relpath] = entry
+    # Commit happens in batches in main() to avoid one fsync per message.
+    _record_fetched(state_conn, msg_id, relpath, internal_ms)
     return "fetched"
 
 
@@ -976,30 +1034,88 @@ def main() -> int:
         log.info("First sync — listing all messages")
         ids_to_fetch = _list_all_message_ids(service)
 
-    log.info(f"Fetching {len(ids_to_fetch)} message(s)")
+    log.info(
+        f"Fetching {len(ids_to_fetch)} message(s) "
+        f"(concurrency={cfg['concurrency']}"
+        + (f", workers={cfg['thread_workers']}" if cfg['concurrency'] == 'threads' else "")
+        + ")")
+
+    # Pre-filter the to-fetch list against the state DB so the
+    # skip-if-known check happens once (in the main thread) instead
+    # of per-worker. Workers can assume every ID they receive needs
+    # a real API call.
+    unknown_ids: list[str] = []
+    n_skipped = 0
+    for mid in ids_to_fetch:
+        if _is_known(state_conn, mid):
+            n_skipped += 1
+        else:
+            unknown_ids.append(mid)
+
+    if n_skipped:
+        log.info(f"  {n_skipped} already in state DB, will fetch {len(unknown_ids)}")
 
     n_fetched = 0
-    n_skipped = 0
     n_fail = 0
-    try:
-        for i, mid in enumerate(ids_to_fetch, 1):
-            result = _fetch_and_save(
-                service, mid, output_root, manifest_entries, state_conn)
-            if result == "fetched":
-                n_fetched += 1
-            elif result == "skipped":
-                n_skipped += 1
-            else:
-                n_fail += 1
 
-            # Commit the state DB periodically so a Ctrl-C doesn't lose
-            # the last few hundred fetches. Balance between durability
-            # and fsync overhead.
-            if i % 100 == 0:
-                state_conn.commit()
-                log.info(
-                    f"  progress {i}/{len(ids_to_fetch)} "
-                    f"(fetched={n_fetched} skipped={n_skipped} failed={n_fail})")
+    def _record_result(result):
+        """Common post-fetch handling used by both modes."""
+        nonlocal n_fetched, n_fail
+        if result is None:
+            n_fail += 1
+            return
+        mid, relpath, internal_ms, entry = result
+        if entry is not None:
+            manifest_entries[relpath] = entry
+        _record_fetched(state_conn, mid, relpath, internal_ms)
+        n_fetched += 1
+
+    try:
+        if cfg["concurrency"] == "threads" and len(unknown_ids) > 1:
+            # Thread-local service objects — httplib2 isn't safe to
+            # share across threads. Benchmarked 4.8x faster than
+            # serial with zero rate-limit errors. See Phase 5.1.6
+            # section in .claude/context/09-source-abstraction-plan.md.
+            tls = threading.local()
+
+            def _worker(msg_id: str):
+                svc = getattr(tls, "service", None)
+                if svc is None:
+                    svc = build("gmail", "v1", credentials=creds,
+                                cache_discovery=False)
+                    tls.service = svc
+                return _fetch_only(svc, msg_id, output_root)
+
+            done = 0
+            with ThreadPoolExecutor(max_workers=cfg["thread_workers"]) as pool:
+                futures = {pool.submit(_worker, mid): mid for mid in unknown_ids}
+                for fut in as_completed(futures):
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        log.debug(f"Worker exception: {e}")
+                        result = None
+                    _record_result(result)
+                    done += 1
+                    if done % 100 == 0:
+                        state_conn.commit()
+                        log.info(
+                            f"  progress {done}/{len(unknown_ids)} "
+                            f"(fetched={n_fetched} skipped_known={n_skipped} "
+                            f"failed={n_fail})")
+        else:
+            # Serial path — for single-item runs or explicit
+            # FSEARCH_GMAIL_CONCURRENCY=serial. Still uses the
+            # split worker/record shape so both modes share code.
+            for i, mid in enumerate(unknown_ids, 1):
+                result = _fetch_only(service, mid, output_root)
+                _record_result(result)
+                if i % 100 == 0:
+                    state_conn.commit()
+                    log.info(
+                        f"  progress {i}/{len(unknown_ids)} "
+                        f"(fetched={n_fetched} skipped_known={n_skipped} "
+                        f"failed={n_fail})")
     finally:
         state_conn.commit()
 

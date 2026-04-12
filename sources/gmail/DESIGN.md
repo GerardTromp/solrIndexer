@@ -417,6 +417,130 @@ run with a fresh cursor resumes normal delete handling.
 7. From then on, the cron job runs headlessly. Refresh tokens last
    indefinitely as long as the script runs at least every ~6 months.
 
+## Concurrency mode (Phase 5.1.6)
+
+The fetch phase is the bottleneck of the whole sync pipeline:
+individual `users.messages.get` calls cost ~600-700ms round-trip
+to Gmail's API, and a ~26k-message first sync is fetch-bound
+(Tika indexing of the resulting `.eml` files is 12-30x faster).
+
+Phase 5.1.6 ships a `benchmark_fetch.py` regression test and uses
+its measurements to drive a serial-vs-threads-vs-batch decision.
+
+### Measurement (2026-04-11, 200-message random sample)
+
+Run against the author's 26k-message mailbox with
+`benchmark_fetch.py --n 200 --seed 42`:
+
+| Mode       | Wall  | Rate  | p50   | p95    | 429s |
+|------------|-------|-------|-------|--------|------|
+| serial     | 140.1s | 1.4/s | 593ms | 1206ms | 0 |
+| threads-5  | 29.5s  | 6.8/s | 591ms | 1503ms | 0 |
+| batch-50   | 11.8s  | 14.5/s | 83ms  | 88ms   | 28 |
+
+- **Serial baseline**: ~700ms per message, essentially all
+  network round-trip. Matches the earlier informal measurement.
+- **Threads-5**: 4.8x faster than serial. **Zero rate-limit
+  errors.** Per-request latency is unchanged from serial, which
+  means the speedup is purely from having 5 requests in flight
+  simultaneously, not from any per-request improvement.
+- **Batch-50**: 11.8x faster in wall-clock, but **14% of
+  sub-requests hit HTTP 429 / `userRateLimitExceeded`**. Gmail
+  treats batch sub-requests as independent per-second quota
+  consumers, and a 50-item batch easily trips the burst limit.
+
+### Decision rules (documented in the plan)
+
+- Batch >5x faster AND zero 429s → ship batch
+- Threads >3x faster AND zero 429s → ship threads
+- Otherwise → keep serial
+
+Applied to measurements:
+
+- batch-50 is 11.8x (MEETS) but has 28 429s (FAILS) → **rejected**
+- threads-5 is 4.8x (MEETS) with 0 429s → **accepted**
+
+### Implementation
+
+`FSEARCH_GMAIL_CONCURRENCY` env var, default `threads`:
+
+- `threads`: use `ThreadPoolExecutor` with `FSEARCH_GMAIL_THREADS`
+  workers (default 5). Each worker owns a per-thread service
+  object stored in `threading.local()` — critical because
+  `httplib2` (which `googleapiclient` uses under the hood) is
+  NOT thread-safe when sharing a single `http` object. Attempts
+  to share one service across workers produce `free(): corrupted
+  unsorted chunks` glibc crashes. This was discovered the hard
+  way during benchmark development.
+- `serial`: the Phase 5 code path, preserved as an escape hatch
+  for anyone who hits quota issues or needs deterministic
+  single-request ordering for debugging.
+
+The sync's `_fetch_and_save` was split into two functions:
+
+- `_fetch_only`: **thread-safe worker**. Does the API call,
+  decodes bytes, writes the `.eml` file, builds the manifest
+  entry dict. Returns `(msg_id, relpath, internal_ms, entry)`
+  or `None`. Touches NO shared state — no sqlite, no manifest
+  dict, no counters.
+- `_fetch_and_save`: thin wrapper used by the serial path that
+  calls `_fetch_only` and then records to the state DB +
+  manifest on the same thread.
+
+In threads mode, the main thread consumes futures via
+`as_completed()` and writes state DB rows + manifest entries
+sequentially. This means sqlite is touched by exactly one thread
+ever, and `manifest_entries` dict mutations happen on exactly one
+thread — no locking needed.
+
+### Why batch was rejected even though it's fastest
+
+The raw 11.8x speedup is extremely tempting, and with production
+retry logic (exponential backoff on 429s) the real throughput
+would likely recover close to that number. Two reasons for not
+pursuing it further:
+
+1. **Complexity cost**. Retry logic needs to track per-sub-request
+   state, back off appropriately on 429, detect quota exhaustion
+   vs transient limits, and surface partial failures to the
+   caller. That's ~100 LOC of its own, all of which needs the
+   same benchmarking discipline as the initial fetch-mode
+   decision. For the marginal win over threads (4.8x → ~10x at
+   most) it's not worth it on a dataset this size.
+2. **Quota uncertainty**. Gmail's published quota is 250 units/sec
+   and `messages.get` costs 5 units. In theory a 50-item batch
+   costs 250 units — right at the limit, not over. But the 429s
+   showed up anyway, suggesting per-IP burst limits below the
+   published number. Ship threads, which stays comfortably under
+   every threshold.
+
+### When to revisit
+
+Reopen the batching decision if ANY of:
+
+- A new Gmail API version documents burst-limit handling for
+  `BatchHttpRequest` sub-requests
+- A user reports an initial sync that still takes too long
+  under threads mode (e.g., hundreds of thousands of messages)
+- `benchmark_fetch.py` reruns show the threads-mode speedup
+  degrading over time (quota tightening, network changes, etc.)
+
+Re-run `benchmark_fetch.py --n 500 --seed 42` and compare
+against the numbers above. If threads-5 drops below 3x, the
+rules say to reconsider batching. The benchmark tool is
+permanently in the repo as a regression backstop for exactly
+this scenario.
+
+### Free micro-optimization that shipped alongside
+
+The `fields` response mask on `messages.get` now restricts the
+Gmail API response to `raw,internalDate,labelIds,threadId` —
+only the fields `_fetch_only` actually consumes. Saves ~30% of
+per-response bandwidth compared to the unmasked default, which
+included snippet, payload parts, size estimates, etc. that were
+decoded and discarded. One-line change, applies uniformly to
+both serial and threads modes.
+
 ## Destructive operations (Phase 5.1.5)
 
 There is exactly one way to permanently remove messages from the
