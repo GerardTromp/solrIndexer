@@ -535,7 +535,18 @@ few days costs nothing meaningful.
    logic changes (auth library updates, Google API shifts, quota
    adjustments). Not a throwaway one-off.
 
-6. **Production cron wiring** (~30 min) — migrate `run_index.sh`
+6. **Phase 5.1.7 email metadata as first-class fields** (~2 hr) —
+   promote From / To / Cc / Subject / Message-ID from the opaque
+   `source_metadata` JSON blob into dedicated indexed fields
+   (`email_from`, `email_to`, ...). Adds 5 new field picker entries
+   in both CLI and GUI, including `sent_since` / `sent_before` for
+   the already-indexed `source_timestamp`. Requires a one-time
+   re-index of existing email docs (scoped delete + resync). See
+   Phase 5.1.7 section below. Motivated by the curation workflow
+   in 5.1.5 — searching "from:alice" is the obvious interactive
+   shape and the current raw `source_metadata:alice` is clunky.
+
+7. **Production cron wiring** (~30 min) — migrate `run_index.sh`
    from positional roots to a `sources.yaml`-driven model, adding
    the Gmail source entry. Done LAST so cron only picks up a
    fully-vetted integration.
@@ -1001,6 +1012,243 @@ state-DB corruption bugs.
 
 ---
 
+## Phase 5.1.7 — Email metadata as first-class Solr fields
+
+**Goal**: promote email From, To, CC, Subject, and Message-ID from
+the opaque `source_metadata` JSON blob into dedicated indexed Solr
+fields, so users can search by these attributes via the CLI, GUI
+dropdown, and full-text catch-all without hand-crafting raw Solr
+queries.
+
+**Motivation**: the Phase 5.1.5b curation workflow immediately
+surfaced the gap. A user who wants to clean out "old newsletters
+from alice@example.com" can find them via
+`fsearch -q 'source_metadata:"alice@example.com"'` (works because
+`source_metadata` is stored, even though it's not indexed — Solr
+falls back to tokenized full-text on stored fields). But:
+
+- It's clunky and requires knowing `source_metadata` exists
+- Substring matching on a JSON string is fragile (`alice` could
+  match `alice-newsletter@` OR `alicenewsletter@` OR
+  `"body\":\"hi alice\"` depending on what Tika extracted into
+  the content preview)
+- Date range queries against email sent-time work via
+  `source_timestamp:[...]` but aren't surfaced in the field picker
+
+**What the schema already has** (no change needed):
+
+- `source_timestamp` (pdate, stored+indexed, Phase 1) — already
+  populated by both `sync.py` (from `internalDate`) and
+  `extract.py` (from Date header). Surfacing it in the GUI
+  dropdown is a UI change, not a schema change.
+
+**New schema fields** (5, all live-addable via `/schema` API):
+
+| Field | Type | Purpose |
+|---|---|---|
+| `email_from` | `text_general` | Tokenized sender |
+| `email_to` | `text_general` | Tokenized recipient(s) |
+| `email_cc` | `text_general` | Tokenized cc list |
+| `email_subject` | `text_general` | Tokenized subject line |
+| `email_message_id` | `string` | Exact-match only (for dedup/threading) |
+
+All four `text_general` fields get a copy field to `_text_` so the
+catch-all full-text search naturally includes email metadata —
+`fsearch text:alice` will find emails from Alice without needing a
+dedicated `from:` clause. The `string`-typed `email_message_id`
+doesn't copy (exact match only, by design).
+
+**Prefix rationale**: `email_` rather than bare `from` / `to` /
+`subject`. The taxonomy describes the content *shape*, not the
+source name. Future non-email sources might have their own
+"subject" fields with different semantics, and bare names would
+collide. `email_*` keeps them cleanly scoped.
+
+**Why text_general not string**: users expect `from:alice` to
+match `alice@example.com`. A string-typed field would only match
+the full canonical form, forcing users to know exact addresses.
+text_general with standard tokenization handles the "partial
+name" case naturally.
+
+### Implementation location
+
+**Single change point: `fs_sources.Manifest` or `fs_indexer.file_to_doc()`.**
+The manifest reader already parses each entry's `metadata` dict. Adding
+a promotion step that pulls known email keys into `email_*` fields on
+the Solr doc is ~20 lines in one place:
+
+```python
+if _CURRENT_MANIFEST:
+    entry = _CURRENT_MANIFEST.lookup(path)
+    if entry:
+        ts = entry.get("source_timestamp")
+        if ts:
+            doc["source_timestamp"] = ts
+        md = entry.get("metadata")
+        if md is not None:
+            doc["source_metadata"] = json.dumps(md, default=str)
+            # Phase 5.1.7: promote known email keys
+            _promote_email_fields(doc, md)
+```
+
+**Zero changes** to `sync.py` or `extract.py` — both already emit
+the exact keys (`from`, `to`, `cc`, `subject`, `message_id`) under
+their `metadata` dicts. Any new source that follows the same
+key-naming convention in its manifest gets the behavior for free.
+
+### Clause builder additions
+
+**CLI (`fsearch.py`)** — five new repeatable filters:
+
+| Flag | Field | Behavior |
+|---|---|---|
+| `--from NAME` | `email_from` | Tokenized match |
+| `--to NAME` | `email_to` | Tokenized match |
+| `--subject TEXT` | `email_subject` | Tokenized match |
+| `--sent-since YYYY-MM-DD` | `source_timestamp` | Range `[date TO *]` |
+| `--sent-before YYYY-MM-DD` | `source_timestamp` | Range `[* TO date]` |
+
+All support the standard repeatable-OR-within-field semantics the
+other filters use. All support negation via `--not-from` etc. `cc`
+is intentionally NOT surfaced in the picker — available via
+`raw: email_cc:foo` when needed but rarely useful interactively.
+
+**GUI (`fsearch_web.py` + `search.html`)** — five new entries in the
+`FIELDS` dropdown:
+
+```javascript
+const FIELDS = [
+  // ... existing ...
+  { value: "from",        label: "From"        },
+  { value: "to",          label: "To"          },
+  { value: "subject",     label: "Subject"     },
+  { value: "sent_since",  label: "Sent since"  },
+  { value: "sent_before", label: "Sent before" },
+];
+```
+
+And matching cases in `_clause_for_row()` in `fsearch_web.py`:
+
+```python
+elif field == "from":
+    return f'email_from:({value})'
+elif field == "to":
+    return f'email_to:({value})'
+elif field == "subject":
+    return f'email_subject:({value})'
+elif field == "sent_since":
+    return f'source_timestamp:[{parse_date(value)} TO *]'
+elif field == "sent_before":
+    return f'source_timestamp:[* TO {parse_date(value)}]'
+```
+
+### Re-indexing existing docs
+
+At the time this phase ships there will likely be tens of thousands
+of gmail/pst docs in Solr that already have `source_metadata` but no
+`email_*` fields, because the Phase 0.2 `_file_unchanged` fast path
+(size + mtime + hash match → skip) will prevent a normal
+`fs_indexer.py` run from touching them.
+
+**Three options considered**:
+
+**A — Explicit delete-then-reindex** (chosen for this phase):
+
+```bash
+curl -s -X POST 'http://localhost:8983/solr/filesystem/update?commit=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"delete":{"query":"source_kind:imap OR source_kind:pst OR source_kind:msg"}}'
+# Clear per-source incremental state so the next run walks fresh
+python3 -c "
+import json, pathlib
+s = pathlib.Path.home() / '.solr/indexer_state.json'
+if s.exists():
+    d = json.loads(s.read_text())
+    for k in list(d.get('sources', {}).keys()):
+        if k in ('gmail','pst-archive','outlook-com'):
+            d['sources'].pop(k, None)
+    s.write_text(json.dumps(d))
+"
+# Nuke the gmail find cache too
+rm -f /mnt/wd1/solr/find_cache_src-gmail* 2>/dev/null
+# Then re-run the indexer for each email source
+fs_indexer.py --source gmail
+```
+
+Explicit, correct, user-visible. For the current ~26k gmail docs
+the re-index takes ~3 minutes based on Phase 5.1 timing (body
+content is already on disk, so Tika is localhost-fast).
+
+**B — Generic `schema_version` field in every doc** (deferred):
+
+Bump a code-level `SCHEMA_VERSION` constant each time we add
+enrichment fields. The `_file_unchanged` check compares the
+doc's stored version to the current one and forces re-processing
+on mismatch. General-purpose, amortizes the cost over future
+schema additions, but one more moving part that needs to be
+maintained.
+
+Recommend adopting this approach IF we find ourselves adding new
+enrichment fields more than once per year. Otherwise the one-time
+explicit reindex is cleaner.
+
+**C — Presence-check extension of `_file_unchanged`** (rejected):
+
+Add `has_email_from` to the tuple `_file_unchanged` returns from
+`fetch_indexed_meta`, analogous to the existing `has_hash` check.
+Doesn't generalize — each new field would need another presence
+check, gradually accumulating tuple fields. Works, but the
+schema_version approach (B) is the right long-term answer.
+
+### Step-wise plan for 5.1.7
+
+1. **Schema live-add** the five new fields via `/schema` API (~2 min)
+2. **`setup/setup_schema.sh` update** so fresh installs match
+3. **`_promote_email_fields()` helper** in `fs_indexer.py` + call
+   site in `file_to_doc()` (~30 min)
+4. **Clause-builder additions** in `fsearch.py` and `fsearch_web.py`
+   (~30 min) — add 5 new field types, 5 new `--not-*` variants
+   for CLI
+5. **GUI `FIELDS` array additions** in `static/search.html` (~5 min)
+6. **Re-index gmail** via the option-A recipe (~5 min)
+7. **Verification**:
+   - `curl ... fl=email_from,email_subject` on a sample doc
+   - `fsearch --from alice --ext eml`
+   - `fsearch --sent-since 2024-01-01 --subject security`
+   - GUI dropdown shows the 5 new options and queries round-trip
+8. **Update docs**: vignette gets a "Searching by email metadata"
+   section; `docs/technical/schema.md` gets the 5 new field rows;
+   `docs/technical/cli.md` gets the 5 new CLI flags
+9. **Commit + push**
+
+**Estimate**: 2 hours for the full phase.
+
+**Dependencies**: independent of 5.1.6. Can be done in any order.
+The only constraint is that it must come AFTER Phase 5.1.5b
+(which exists) because the 5.1.5 curation workflow is what
+justified the investigation.
+
+**Explicitly NOT done in this phase**:
+
+- **Promoting labels / thread_id / folder to dedicated fields.**
+  Gmail-specific and PST/Outlook-specific fields respectively.
+  They already search fine via `raw:` queries against
+  `source_metadata`. Promoting them requires schema evolution
+  decisions (multi-valued string? facet-ready strings?) that are
+  out of scope for the "let me find mail from Alice" use case.
+- **A dedicated "email date" pdate separate from
+  `source_timestamp`.** The existing field already holds real
+  sent-time for both gmail and pst sources. The GUI change is
+  purely surfacing it, not adding a new field.
+- **Tokenizer / analyzer tuning for email addresses.** The
+  default `text_general` tokenizer splits on `@` and `.`, which
+  means `from:alice` finds `alice@example.com` naturally. Good
+  enough. If someone needs "exact email-address match", the
+  raw `email_message_id:` field or raw queries against
+  `source_metadata:` serve as escape hatches.
+
+---
+
 ### 5.1.6 — Fetch optimization (optional sub-task)
 
 **Motivation**: the Gmail Phase 5 first-sync is fetch-bound, not
@@ -1146,6 +1394,7 @@ incremental cycle, then benchmark.
 | 5.1 Gmail refinements (core: sqlite + skip-if-known + mirror/archive) | 5 | 3–5 hr | Yes |
 | 5.1.5a Curation — `sync.py --prune` CLI | 5.1 core | 2 hr | Yes |
 | 5.1.5b Curation — GUI clipboard + `/api/docs_by_id` | 5.1.5a | 3–4 hr | Yes |
+| 5.1.7 Email metadata as first-class Solr fields | 5.1.5b | 2 hr | Yes |
 | 5.1.6 Fetch optimization (benchmark + concurrency) | 5.1 core | 2–6 hr | Yes |
 | 6 Outlook    | 1,2,3 (+separate repo) | 1–2 days | External |
 
