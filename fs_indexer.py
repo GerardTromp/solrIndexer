@@ -164,7 +164,8 @@ TEXT_EXTS = {
     ".ipynb",                    # notebook JSON — content-searchable
 }
 
-TIKA_EXTS = {".pdf",".docx",".xlsx",".pptx",".odt",".ods",".odp",".epub",".rtf"}
+TIKA_EXTS = {".pdf",".docx",".xlsx",".pptx",".odt",".ods",".odp",".epub",".rtf",
+             ".eml",".msg",".mbox"}
 
 SKIP_DIRS = {
     ".git",".svn",".hg",
@@ -435,6 +436,9 @@ _TIKA_MIME = {
     ".odp":  "application/vnd.oasis.opendocument.presentation",
     ".epub": "application/epub+zip",
     ".rtf":  "application/rtf",
+    ".eml":  "message/rfc822",
+    ".msg":  "application/vnd.ms-outlook",
+    ".mbox": "application/mbox",
 }
 
 # ── Content extraction ───────────────────────────────────────────────────────

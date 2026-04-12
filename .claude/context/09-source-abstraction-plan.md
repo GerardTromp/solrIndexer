@@ -490,6 +490,282 @@ plan** — documented here so the abstraction is right.
 
 ---
 
+## Phase 5.1 — Gmail sync refinements
+
+**Goal**: bring the Gmail source up to the robustness bar set by the PST
+and Outlook COM sources. Specifically: never re-fetch a message whose
+bytes are already on disk, and give users an explicit choice between
+"local archive" (default, safe) and "mirror Gmail state" (opt-in).
+
+**Motivation**: discovered during the Gmail Phase 5 bring-up with a
+live mailbox. Current behavior: `_fetch_and_save()` unconditionally
+overwrites the `.eml` file on disk whether or not the same message
+was already fetched in a previous run. Three concrete problems:
+
+1. **Interruption recovery is expensive.** If the first full sync is
+   Ctrl-C'd partway through its ~26k-message walk, the next run
+   re-fetches everything from scratch because the on-disk files don't
+   factor into the dedup check. Only the manifest is loaded back, and
+   the manifest alone doesn't gate API calls.
+2. **No mirror/archive distinction.** A user who deletes a Gmail
+   message expecting it to disappear from search is surprised when
+   it's still there. A user who deletes a Gmail message by accident
+   and expects search to preserve history is surprised if it isn't.
+   Same default can't be right for both — needs to be explicit.
+3. **Labels go stale.** `labelsChanged` history events are ignored,
+   so `source_metadata.labels` decays. Lower priority; deferred to
+   Phase 5.2 after we've seen how much it matters in practice.
+
+**Files touched**:
+- `sources/gmail/sync.py` — state DB, skip-if-known, optional delete handling
+- `sources/gmail/DESIGN.md` — record the decisions and rejected alternatives
+- `docs/vignettes/gmail-wiring.md` — mention `FSEARCH_GMAIL_MIRROR` env var
+
+**Changes**:
+
+### 1. SQLite state DB
+
+Add a sibling `.gmail_state.sqlite` next to `.gmail_state.json` with
+one table:
+
+```sql
+CREATE TABLE fetched (
+    msg_id       TEXT PRIMARY KEY,   -- Gmail message ID
+    relpath      TEXT NOT NULL,      -- .eml path relative to output root
+    internal_ms  INTEGER,            -- for sanity-check only
+    fetched_at   TEXT                -- ISO8601 UTC
+);
+```
+
+Why SQLite and not JSON: a 26k-msg mailbox is right at the edge where
+JSON atomic writes get uncomfortable. Every subsequent sync appends
+to the state, and by year 5 this is easily 50k+ entries. Matches the
+Outlook source's choice for the same reason.
+
+Separate from `.gmail_state.json`: the JSON file carries the history
+cursor and is rewritten atomically on each run. The sqlite is the
+"what's on disk" ledger and gets appended to as fetches succeed.
+Two different lifecycles.
+
+### 2. Skip-if-known check
+
+`_fetch_and_save()` grows a preliminary query:
+
+```python
+if _is_known(conn, msg_id):
+    return True   # already on disk from a previous run
+```
+
+Also wrap the existing manifest-update so a skipped message still has
+its manifest entry copied forward from the loaded previous-run
+manifest (already handled since we load existing entries at startup).
+
+### 3. Migration helper
+
+For users upgrading from Phase 5 to 5.1 with an already-populated
+output dir, automatically backfill the sqlite DB from the on-disk
+`.eml` tree on first startup:
+
+- If the sqlite file is absent BUT the output root has `.eml` files,
+  walk the tree, extract the Gmail msg_id from each filename
+  (it's embedded in our path layout as the `<short-id>` suffix)
+- Insert rows into the new DB without fetching anything
+- Log `"Migrated N existing files to state DB"`
+- Subsequent runs are fast
+
+Caveat: the filename currently stores only the first 16 chars of the
+msg_id, which is *probably* unique across a user's mailbox but isn't
+guaranteed by the Gmail API. For the migration path, we take the
+pragmatic approach: if two different full msg_ids truncate to the
+same prefix, one of them gets re-fetched on the next incremental
+run (the sqlite insertion for the dupe prefix fails, fetch proceeds,
+new file overwrites). Acceptable edge case for a one-time migration.
+
+### 4. Mirror vs archive toggle
+
+New env var `FSEARCH_GMAIL_MIRROR` (default: unset = archive mode).
+
+- **Archive mode (default)**: `messagesDeleted` history events are
+  logged at debug and ignored. Local `.eml` files never disappear
+  because Gmail state changed.
+- **Mirror mode (`FSEARCH_GMAIL_MIRROR=true`)**: `messagesDeleted`
+  events cause the corresponding `.eml` file AND sqlite row to be
+  removed. The next `fs_indexer.py` run's purge pass notices the
+  file is gone and deletes the Solr doc.
+
+Rationale for archive-as-default:
+- The risk of an accidental Gmail delete silently erasing a search
+  archive is worse than the cost of some stale `.eml` files
+- Once a message is in Solr, the local file is the "reason" for
+  the Solr doc's existence — mirroring Gmail state breaks that
+  causal chain
+- Users who genuinely want mirror mode are technical enough to set
+  an env var; users who haven't thought about it benefit from the
+  safer default
+
+### 5. Documentation
+
+`sources/gmail/DESIGN.md` grows a new section explaining the
+archive/mirror distinction, citing the causal-chain argument above.
+`docs/vignettes/gmail-wiring.md` gets a new "Ongoing maintenance"
+entry under "When deletes matter" explaining the knob.
+
+### What this phase does NOT do
+
+- **Label-change tracking** — deferred to Phase 5.2. The right fix
+  is metadata-only refetch via `format=metadata` on `labelsChanged`
+  history events, but we want real-world observation of staleness
+  before investing in it.
+- **`.eml` integrity verification** — no MD5/SHA check between disk
+  and Gmail's returned bytes. Gmail's RFC822 output for a given
+  message is stable; verification would cost an extra hash per
+  existing file for zero real benefit.
+- **Rate limiting / backoff tuning** — if the skip-if-known reduces
+  API calls enough that Phase 5 quota pressure disappears, no need.
+  Revisit only if we see 429s in practice.
+
+**Acceptance criteria**:
+
+1. Run a full sync, Ctrl-C at ~5% progress. Re-run. The second run
+   completes in seconds, not hours, because `_is_known` returns True
+   for everything already on disk.
+2. Delete one `.eml` file manually and re-run. The script refetches
+   *that* message (because it's not in the sqlite either) and leaves
+   the rest alone.
+3. `fs_indexer.py --source gmail` still produces the same Solr
+   output as Phase 5. No schema changes.
+4. Upgrading from a Phase-5 install with an existing manifest and
+   ~26k `.eml` files: one migration log line, then normal
+   incremental behavior.
+
+**Estimate**: 3–5 hours. Includes DESIGN.md update, docs update,
+and manual upgrade-path testing. No new dependencies.
+
+### 5.1.6 — Fetch optimization (optional sub-task)
+
+**Motivation**: the Gmail Phase 5 first-sync is fetch-bound, not
+index-bound. Concrete measurement from the initial bring-up showed
+~100 msgs/min = ~600ms per message, almost entirely network round-trip
+to `googleapis.com`. Tika indexing of the resulting `.eml` files is
+12–30× faster. So any meaningful speedup for first-syncs and large
+re-syncs lives in the fetch phase.
+
+**Approach**: "measure first, then optimize." Do NOT implement any
+parallelism before running a small benchmark against real API quota
+limits. A blind parallel rewrite risks 429s, quota burn, and
+wall-clock regressions from retry loops.
+
+**The benchmark**:
+
+After Phase 5.1 core (sqlite state DB + skip-if-known) ships and a
+user has a populated state DB with N known-good message IDs, run a
+standalone microbenchmark script `sources/gmail/benchmark_fetch.py`
+that fetches a fixed subset (e.g., 200 messages selected by
+`ORDER BY internal_ms DESC LIMIT 200`) in three modes:
+
+1. **Serial** (current Phase 5 path): one `messages.get` at a time
+2. **ThreadPoolExecutor with N=5**: each worker has its own HTTP
+   connection but shares credentials + service object
+3. **BatchHttpRequest with batch_size=50**: Google's native batching
+   API (`googleapiclient.http.BatchHttpRequest`) — up to 100
+   sub-requests per HTTP call, Gmail recommends ≤50
+
+For each mode record:
+- Wall-clock time for the 200-message run
+- Total quota units charged (via response headers or a delta on
+  Google's quota dashboard)
+- Any HTTP 429 / `userRateLimitExceeded` / `rateLimitExceeded` errors
+- Observed per-message throughput distribution (p50, p95, p99)
+
+**Decision rules** (applied after measurement):
+
+- If mode 3 is >5× faster than mode 1 with zero rate-limit errors,
+  ship mode 3 as the default. This is the "real" expected outcome.
+- If mode 3 hits rate limits but mode 2 is >3× faster without errors,
+  ship mode 2 as the default. Threads are a cleaner fallback than
+  half-batching.
+- If neither is >3× faster than serial, ship neither; document the
+  null result in DESIGN.md and move on.
+- Keep serial code path as a `FSEARCH_GMAIL_CONCURRENCY=serial`
+  fallback regardless of which mode wins, so users who hit quota
+  issues have an escape hatch.
+
+**Orthogonal micro-optimizations** (land with whichever concurrency
+mode wins):
+
+- **`fields` mask on messages.get**: current code accepts the full
+  JSON response and discards most of it. Adding
+  `fields='raw,internalDate,labelIds,threadId'` to the get request
+  saves ~30% response bandwidth per call. One-line change, no risk,
+  applies uniformly to serial and parallel paths.
+- **HTTP/2 connection reuse**: the `googleapiclient` transport uses
+  `httplib2` which supports keep-alive but not HTTP/2. Switching to
+  `google-auth-httplib2` with a pooled session object is a separate
+  experiment; measure whether it helps *after* the main concurrency
+  change lands. Skip if mode 3 (batching) is already fast enough.
+
+**Rejected approaches**:
+
+- **`asyncio` + `aiohttp` rewrite**: would give cleaner concurrency
+  primitives but no meaningful speedup over threads for this
+  workload. The fetch loop is IO-bound; threads handle that just
+  fine, and keeping the sync code structure means less risk of
+  subtle bugs in the auth/retry paths.
+- **Pipelining fetch vs. disk write**: ~5% potential win since
+  writes to `/mnt/wd1` NVMe are in the low-millisecond range. Not
+  worth the producer/consumer queue complexity unless we're already
+  rewriting the fetch loop.
+- **Overlapping sync with fs_indexer walk**: wall-clock win bounded
+  by min(fetch, index), which for Gmail is ~20% (index is 12–30×
+  faster than fetch, so most overlap is wasted). Breaks the clean
+  hook+walk contract of the source abstraction. Explicitly deferred.
+- **`watch` + Pub/Sub push**: Gmail supports real-time push
+  notifications via Cloud Pub/Sub. Significant architectural shift
+  (requires a long-running webhook receiver or a Pub/Sub pull
+  worker), sub-minute latency is not a current goal, one-off first
+  sync is the pain point. Not this phase. Documented as a "when to
+  throw this away" trigger in sources/gmail/DESIGN.md.
+- **Headers-only metadata-only indexing**: a different product, not
+  an optimization. Solr would hold manifest-sourced metadata
+  (from/subject/date) but not body content. No full-text search.
+  Potentially valuable for mailboxes where full-body fetch is
+  impractical (hundreds of thousands to millions of messages), but
+  Phase 5.1 is scoped to "make the current functionality faster,"
+  not "ship a lite variant." Record as a future Phase 5.3 idea if
+  real demand appears.
+
+**Files touched** (if an optimized mode ships):
+
+- `sources/gmail/sync.py` — new concurrency dispatcher around
+  `_fetch_and_save`, new `FSEARCH_GMAIL_CONCURRENCY` env var
+- `sources/gmail/benchmark_fetch.py` — the measurement tool itself,
+  kept in the tree so future regressions can be checked
+- `sources/gmail/DESIGN.md` — decision record with actual measured
+  numbers (not estimates) and the rejected approaches
+
+**Acceptance criteria** (in addition to the core 5.1 criteria):
+
+5. `benchmark_fetch.py` runs cleanly against a populated state DB
+   and produces a three-column comparison table on stderr.
+6. If an optimized mode ships, a 1000-message re-sync from a clean
+   state is at least 3× faster than the Phase 5 baseline measured
+   today (~100 msgs/min).
+7. `FSEARCH_GMAIL_CONCURRENCY=serial` still works as an escape
+   hatch and matches Phase 5 behavior byte-for-byte on output.
+8. No new 429 errors in logs under default settings. Document the
+   observed quota ceiling in DESIGN.md for future reference.
+
+**Estimate**: 2–4 hours IF batching works as advertised. 4–6 hours
+if we have to fall back to threads and re-measure. Includes the
+benchmark tool, the chosen implementation, and the DESIGN.md update.
+
+**Dependency note**: 5.1.6 depends on 5.1 core (sqlite + skip-if-known)
+because the benchmark needs a populated state DB to select known-good
+IDs. Ship core first, let it run against real data for at least one
+incremental cycle, then benchmark.
+
+---
+
 ## Sequencing summary
 
 | Phase | Deps | Est. | Ship independently? |
@@ -502,6 +778,8 @@ plan** — documented here so the abstraction is right.
 | 3 Manifest   | 1,2 | 2 hr | Yes |
 | 4 PST        | 1,2,3 | 4–8 hr | Yes |
 | 5 Gmail      | 1,2,3 | 4–6 hr | Yes |
+| 5.1 Gmail refinements (core: sqlite + skip-if-known + mirror/archive) | 5 | 3–5 hr | Yes |
+| 5.1.6 Fetch optimization (benchmark + concurrency) | 5.1 core | 2–6 hr | Yes |
 | 6 Outlook    | 1,2,3 (+separate repo) | 1–2 days | External |
 
 Each phase is committed separately. Total in-repo work: ~25 hours of focused
