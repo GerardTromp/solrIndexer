@@ -167,6 +167,18 @@ TEXT_EXTS = {
 TIKA_EXTS = {".pdf",".docx",".xlsx",".pptx",".odt",".ods",".odp",".epub",".rtf",
              ".eml",".msg",".mbox"}
 
+# Sidecar state / manifest files that sources write next to their data.
+# These are never indexed as searchable documents — they're infrastructure
+# for the source, not content. New sources can add their state filenames
+# here without touching file_to_doc() itself.
+SOURCE_SIDECAR_FILENAMES = {
+    ".manifest.json",         # fs_sources.Manifest sidecar (Phase 3)
+    ".gmail_state.json",      # gmail sync history cursor
+    ".gmail_state.sqlite",    # gmail sync state DB (Phase 5.1)
+    ".extract_state.json",    # pst extractor per-PST signatures
+    ".export_state.sqlite",   # outlook COM exporter state DB
+}
+
 SKIP_DIRS = {
     ".git",".svn",".hg",
     "__pycache__",".pytest_cache",".mypy_cache",
@@ -579,9 +591,10 @@ def file_to_doc(path: Path, large_files: bool = False) -> dict | None:
     try:
         if path.name.startswith("~$"):   # Office lock/temp files — always garbage
             return None
-        if path.name == ".manifest.json":
-            # Sidecar metadata file consumed by the manifest reader —
-            # never indexed as a searchable doc itself.
+        if path.name in SOURCE_SIDECAR_FILENAMES:
+            # Sidecar state / manifest files that sources write next to
+            # their data. Consumed by source scripts / the manifest reader,
+            # never indexed as searchable documents.
             return None
         s = path.stat()
         if stat.S_ISLNK(s.st_mode):   # skip symlinks to avoid loops

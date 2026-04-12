@@ -492,8 +492,46 @@ plan** — documented here so the abstraction is right.
 
 ## Phase 5.1 — Gmail sync refinements
 
-**Goal**: bring the Gmail source up to the robustness bar set by the PST
-and Outlook COM sources. Specifically: never re-fetch a message whose
+**Guiding principle** (captured 2026-04-11, post-bring-up):
+**"Fail fast, then fix it the correct way."** The Phase 5 live bring-up
+surfaced three real correctness gaps plus a trivial cleanup item. Rather
+than layer a production cron on top of known rough edges, close every
+gap before promoting the source to nightly cron status. Discomfort of
+"still not production" is temporary; the alternative (cron running
+against a flaky sync path and silently wasting API quota, or worse,
+losing data on interruption) accumulates debt that is much harder to
+repay later. The daily volume of trivial-but-deletable messages in a
+typical user's Gmail is low enough that deferring cron integration by a
+few days costs nothing meaningful.
+
+**Step-wise plan** (sequenced, independent commits):
+
+1. **Sidecar cleanup** (~15 min) — extend `file_to_doc()`'s skip
+   list beyond `.manifest.json` to also cover `.gmail_state.json`,
+   `.extract_state.json`, and `.extract_state.sqlite`. Any future
+   source can add its state file to the same list. Tiny warmup
+   change that lives in the same file as everything else we're about
+   to touch.
+
+2. **Phase 5.1 core** (3–5 hr) — sqlite state DB, skip-if-known,
+   migration helper, archive/mirror toggle. Details below. The
+   substantive correctness work.
+
+3. **Phase 5.1.6 fetch optimization** (2–6 hr) — benchmark script
+   first, measurement, then implementation only if decision
+   thresholds are met. The `benchmark_fetch.py` tool is a **permanent
+   commitment**: it stays in the repo alongside the chosen
+   implementation as a regression-test backstop for any future fetch
+   logic changes (auth library updates, Google API shifts, quota
+   adjustments). Not a throwaway one-off.
+
+4. **Production cron wiring** (~30 min) — migrate `run_index.sh`
+   from positional roots to a `sources.yaml`-driven model, adding
+   the Gmail source entry. Done LAST so cron only picks up a
+   fully-vetted integration.
+
+**Goal of this phase**: bring the Gmail source up to the robustness bar set by
+the PST and Outlook COM sources. Specifically: never re-fetch a message whose
 bytes are already on disk, and give users an explicit choice between
 "local archive" (default, safe) and "mirror Gmail state" (opt-in).
 
@@ -739,7 +777,12 @@ mode wins):
 - `sources/gmail/sync.py` — new concurrency dispatcher around
   `_fetch_and_save`, new `FSEARCH_GMAIL_CONCURRENCY` env var
 - `sources/gmail/benchmark_fetch.py` — the measurement tool itself,
-  kept in the tree so future regressions can be checked
+  **permanently committed** to the tree as a regression-test backstop.
+  Any future change to fetch logic (auth library update, Google API
+  shift, concurrency-mode re-tuning, quota policy changes) should
+  re-run this before merging. The tool is NOT optional follow-up
+  work; it ships alongside whichever implementation wins the
+  benchmark, in the same commit.
 - `sources/gmail/DESIGN.md` — decision record with actual measured
   numbers (not estimates) and the rejected approaches
 
